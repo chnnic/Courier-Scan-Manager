@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -298,6 +298,12 @@ LANGUAGES = {
     "en": "English",
     "id": "Bahasa Indonesia",
 }
+DEFAULT_LANGUAGE_CODE = "id"
+
+
+def normalize_language_code(value: str | None) -> str:
+    code = (value or "").strip().lower()
+    return code if code in LANGUAGES else DEFAULT_LANGUAGE_CODE
 
 TRANSLATIONS = {
     "zh": {
@@ -1248,6 +1254,7 @@ class Database:
         self.set_setting_if_missing("sound_enabled", "1")
         self.set_setting_if_missing("operator_shortcuts", "")
         self.set_setting_if_missing("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)
+        self.set_setting_if_missing("language_code", DEFAULT_LANGUAGE_CODE)
 
     def set_setting_if_missing(self, key: str, value: str) -> None:
         cursor = self.conn.cursor()
@@ -2555,8 +2562,9 @@ class CourierApp:
         self.tk = tk_mod
         self.ttk = ttk_mod
         self.messagebox = messagebox_mod
-        self.language_code = "zh"
+        self.language_code = DEFAULT_LANGUAGE_CODE
         self.db = MonthlyDatabaseManager(CONFIG_DB_PATH, self.t)
+        self.language_code = normalize_language_code(self.db.get_setting("language_code", DEFAULT_LANGUAGE_CODE))
         self.exporter = ReportExporter(self.db)
         self.backup_manager = BackupManager(self.db, BACKUP_DIR)
         self.update_manager = UpdateManager(APP_DIR, UPDATE_DIR)
@@ -3905,6 +3913,7 @@ class CourierApp:
             if label == selected_label:
                 self.language_code = code
                 break
+        self.db.set_setting("language_code", self.language_code)
         self.apply_language()
 
     def apply_language(self) -> None:
