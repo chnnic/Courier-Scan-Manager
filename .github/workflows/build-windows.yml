@@ -30,7 +30,7 @@ jobs:
       - name: Build executable
         working-directory: app
         run: |
-          pyinstaller --noconsole --onefile --name CourierScanManager app.py
+          pyinstaller --noconsole --onefile --runtime-tmpdir .courier_runtime --name CourierScanManager app.py
 
       - name: Compute SHA256
         shell: pwsh

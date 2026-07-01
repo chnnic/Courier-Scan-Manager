@@ -4,7 +4,7 @@ python -m pip install --upgrade pip
 python -m pip install pyinstaller
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-pyinstaller --noconsole --onefile --name CourierScanManager app.py
+pyinstaller --noconsole --onefile --runtime-tmpdir .courier_runtime --name CourierScanManager app.py
 echo.
 echo Build complete. EXE path:
 echo %cd%\dist\CourierScanManager.exe

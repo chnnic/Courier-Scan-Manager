@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2496,9 +2496,48 @@ class UpdateManager:
     def is_supported_environment(self) -> bool:
         return sys.platform.startswith("win") and getattr(sys, "frozen", False)
 
+    def should_use_windows_downloader(self) -> bool:
+        return sys.platform.startswith("win") and getattr(sys, "frozen", False)
+
+    def run_powershell(self, script: str, *args: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, *args],
+                check=True,
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+            raise OSError(stderr or str(exc)) from exc
+        return completed.stdout
+
+    def fetch_text_with_powershell(self, url: str) -> str:
+        script = """
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$response = Invoke-WebRequest -UseBasicParsing -Uri $args[0]
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Write($response.Content)
+"""
+        return self.run_powershell(script, url).decode("utf-8-sig", errors="replace")
+
+    def download_file_with_powershell(self, url: str, target_path: Path) -> None:
+        script = """
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -UseBasicParsing -Uri $args[0] -OutFile $args[1]
+"""
+        self.run_powershell(script, url, str(target_path))
+
     def fetch_manifest(self, manifest_url: str) -> dict[str, Any]:
-        with urlopen(manifest_url, timeout=20) as response:
-            payload = response.read().decode("utf-8")
+        if self.should_use_windows_downloader():
+            payload = self.fetch_text_with_powershell(manifest_url)
+        else:
+            with urlopen(manifest_url, timeout=20) as response:
+                payload = response.read().decode("utf-8")
         manifest = json.loads(payload)
         if not isinstance(manifest, dict):
             raise ValueError("manifest_not_dict")
@@ -2529,12 +2568,17 @@ class UpdateManager:
         parsed = urlparse(download_url)
         file_name = Path(parsed.path).name or "courier_update.exe"
         target_path = self.update_dir / file_name
-        with urlopen(download_url, timeout=60) as response, target_path.open("wb") as output:
-            while True:
-                chunk = response.read(1024 * 128)
-                if not chunk:
-                    break
-                output.write(chunk)
+        self.update_dir.mkdir(parents=True, exist_ok=True)
+        target_path.unlink(missing_ok=True)
+        if self.should_use_windows_downloader():
+            self.download_file_with_powershell(download_url, target_path)
+        else:
+            with urlopen(download_url, timeout=60) as response, target_path.open("wb") as output:
+                while True:
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    output.write(chunk)
         if expected_sha256:
             digest = hashlib.sha256(target_path.read_bytes()).hexdigest().lower()
             if digest != expected_sha256.strip().lower():
