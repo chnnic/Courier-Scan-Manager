@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2852,12 +2852,12 @@ class CourierApp:
         else:
             self.input_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
             self.quick_block_recent_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=0)
-            self.scan_entry_area.columnconfigure(0, weight=6)
-            self.scan_entry_area.columnconfigure(1, weight=4)
+            self.scan_entry_area.columnconfigure(0, weight=3)
+            self.scan_entry_area.columnconfigure(1, weight=1)
             self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
             self.right_panel.grid(row=0, column=1, sticky="nsew", padx=0)
-            self.dashboard.columnconfigure(0, weight=6)
-            self.dashboard.columnconfigure(1, weight=4)
+            self.dashboard.columnconfigure(0, weight=3)
+            self.dashboard.columnconfigure(1, weight=1)
             self.dashboard.rowconfigure(0, weight=1)
             self.dashboard.rowconfigure(1, weight=0)
 
@@ -2910,8 +2910,8 @@ class CourierApp:
 
         self.scan_entry_area = self.ttk.Frame(top_frame)
         self.scan_entry_area.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self.scan_entry_area.columnconfigure(0, weight=6)
-        self.scan_entry_area.columnconfigure(1, weight=4)
+        self.scan_entry_area.columnconfigure(0, weight=3)
+        self.scan_entry_area.columnconfigure(1, weight=1)
         self.scan_entry_area.rowconfigure(0, weight=1)
 
         self.input_frame = self.ttk.LabelFrame(self.scan_entry_area, text=self.t("scan_frame"), padding=12)
@@ -2988,9 +2988,9 @@ class CourierApp:
         self.quick_block_recent_tree.heading("tracking_number", text=self.t("tracking_number").rstrip(":"))
         self.quick_block_recent_tree.heading("entry_type", text=self.t("entry_type"))
         self.quick_block_recent_tree.heading("created_at", text=self.t("shipped_at"))
-        self.quick_block_recent_tree.column("tracking_number", width=180)
-        self.quick_block_recent_tree.column("entry_type", width=90, anchor="center")
-        self.quick_block_recent_tree.column("created_at", width=150)
+        self.quick_block_recent_tree.column("tracking_number", width=180, stretch=False)
+        self.quick_block_recent_tree.column("entry_type", width=90, anchor="center", stretch=False)
+        self.quick_block_recent_tree.column("created_at", width=150, stretch=False)
         self.quick_block_recent_tree.grid(row=0, column=0, sticky="nsew")
 
         self.duplicate_policy_label = self.ttk.Label(self.input_frame, text=self.t("duplicate_policy_label"))
@@ -3039,8 +3039,8 @@ class CourierApp:
 
         self.dashboard = self.ttk.Frame(self.scan_content, padding=(16, 0, 16, 16))
         self.dashboard.pack(fill="both", expand=True)
-        self.dashboard.columnconfigure(0, weight=6)
-        self.dashboard.columnconfigure(1, weight=4)
+        self.dashboard.columnconfigure(0, weight=3)
+        self.dashboard.columnconfigure(1, weight=1)
         self.dashboard.rowconfigure(0, weight=1)
 
         self.left_panel = self.ttk.LabelFrame(self.dashboard, text=self.t("recent_records"), padding=12)
