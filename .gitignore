@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+build/
+dist/
+*.spec
+
+*.db
+exports/
+backups/
+archives/
+updates/

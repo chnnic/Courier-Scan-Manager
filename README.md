@@ -19,13 +19,15 @@ This repository is used for Windows release delivery and online update metadata.
 
 ```json
 {
-  "version": "1.1.0",
-  "download_url": "https://github.com/chnnic/Courier-Scan-Manager/releases/download/v1.1.0/CourierScanManager.exe",
+  "version": "1.2.0",
+  "download_url": "https://github.com/chnnic/Courier-Scan-Manager/releases/download/v1.2.0/CourierScanManager.exe",
   "sha256": ""
 }
 ```
 
 ## Notes
 
-- The application stores user data outside the exe folder, so updating the exe does not remove shipment records.
+- The application now stores `courier_config.db` and monthly databases like `courier_2026_07.db` beside the exe.
+- Replacing only `CourierScanManager.exe` does not remove shipment records.
+- Deleting the whole app folder will also delete the local databases, so releases should favor in-app upgrade or exe-only replacement.
 - If you want stronger download verification, fill in the `sha256` field with the exe checksum for each release.

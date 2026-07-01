@@ -1,0 +1,1 @@
+# Tkinter and sqlite3 are included with standard Python on Windows.
