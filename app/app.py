@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.2.10"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2782,7 +2782,7 @@ class CourierApp:
         self.selected_company_id: int | None = None
         self.backup_sort_descending = True
 
-        self.root.title(self.t("app_title"))
+        self.root.title(self.window_title())
         self.root.geometry("1220x780")
         self.root.minsize(960, 620)
 
@@ -2844,6 +2844,9 @@ class CourierApp:
     def t(self, key: str, **kwargs: Any) -> str:
         template = TRANSLATIONS.get(self.language_code, TRANSLATIONS["zh"]).get(key, key)
         return template.format(**kwargs) if kwargs else template
+
+    def window_title(self) -> str:
+        return f"{self.t('app_title')} v{APP_VERSION}"
 
     def duplicate_policy_labels(self) -> dict[str, str]:
         return {
@@ -4163,7 +4166,7 @@ class CourierApp:
         self.apply_language()
 
     def apply_language(self) -> None:
-        self.root.title(self.t("app_title"))
+        self.root.title(self.window_title())
         self.language_label.config(text=self.t("language"))
         self.language_combo.configure(values=list(LANGUAGES.values()))
         self.language_var.set(LANGUAGES[self.language_code])
