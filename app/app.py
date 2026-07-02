@@ -19,7 +19,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.12"
+APP_VERSION = "1.2.13"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -497,7 +497,8 @@ TRANSLATIONS = {
         "update_backup_failed": "升级前备份失败:\n{error}",
         "update_settings_title": "在线升级设置",
         "update_manifest_label": "升级清单地址:",
-        "update_settings_saved": "升级清单地址已保存。",
+        "auto_check_updates_on_startup": "启动软件时自动检查更新",
+        "update_settings_saved": "升级设置已保存。",
         "update_settings_button": "升级设置",
         "backup_success": "备份成功",
         "backup_success_message": "数据库备份已保存到:\n{path}",
@@ -748,7 +749,8 @@ TRANSLATIONS = {
         "update_backup_failed": "Failed to create a pre-update backup:\n{error}",
         "update_settings_title": "Online Update Settings",
         "update_manifest_label": "Update Manifest URL:",
-        "update_settings_saved": "Update manifest URL saved.",
+        "auto_check_updates_on_startup": "Check for updates when the app starts",
+        "update_settings_saved": "Update settings saved.",
         "update_settings_button": "Update Settings",
         "backup_success": "Backup Successful",
         "backup_success_message": "Database backup saved to:\n{path}",
@@ -999,7 +1001,8 @@ TRANSLATIONS = {
         "update_backup_failed": "Gagal membuat cadangan sebelum pembaruan:\n{error}",
         "update_settings_title": "Pengaturan Pembaruan Online",
         "update_manifest_label": "URL Manifest Pembaruan:",
-        "update_settings_saved": "URL manifest pembaruan disimpan.",
+        "auto_check_updates_on_startup": "Periksa pembaruan saat aplikasi dibuka",
+        "update_settings_saved": "Pengaturan pembaruan disimpan.",
         "update_settings_button": "Pengaturan Update",
         "backup_success": "Pencadangan Berhasil",
         "backup_success_message": "Cadangan database disimpan di:\n{path}",
@@ -1304,6 +1307,7 @@ class Database:
         self.set_setting_if_missing("block_unrecognized_enabled", "0")
         self.set_setting_if_missing("operator_shortcuts", "")
         self.set_setting_if_missing("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)
+        self.set_setting_if_missing("auto_check_updates_on_startup", "0")
         self.set_setting_if_missing("language_code", DEFAULT_LANGUAGE_CODE)
 
     def set_setting_if_missing(self, key: str, value: str) -> None:
@@ -2898,6 +2902,7 @@ class CourierApp:
         self.refresh_all_views()
         self.root.bind("<Configure>", self.on_root_resize)
         self.root.after(50, self.update_scan_layout_mode)
+        self.root.after(3000, self.auto_check_for_updates_on_startup)
 
     def t(self, key: str, **kwargs: Any) -> str:
         template = TRANSLATIONS.get(self.language_code, TRANSLATIONS["zh"]).get(key, key)
@@ -4733,7 +4738,7 @@ class CourierApp:
     def open_update_settings(self) -> None:
         selector = self.tk.Toplevel(self.root)
         selector.title(self.t("update_settings_title"))
-        selector.geometry("720x180")
+        selector.geometry("720x230")
         selector.transient(self.root)
         selector.grab_set()
 
@@ -4746,28 +4751,47 @@ class CourierApp:
         manifest_var = self.tk.StringVar(value=self.db.get_setting("update_manifest_url", ""))
         manifest_entry = self.ttk.Entry(frame, textvariable=manifest_var)
         manifest_entry.grid(row=1, column=0, sticky="ew", pady=(8, 12))
+        auto_check_var = self.tk.BooleanVar(value=self.db.get_setting("auto_check_updates_on_startup", "0") == "1")
+        auto_check_box = self.ttk.Checkbutton(
+            frame,
+            text=self.t("auto_check_updates_on_startup"),
+            variable=auto_check_var,
+        )
+        auto_check_box.grid(row=2, column=0, sticky="w", pady=(0, 12))
 
         def save_manifest_url() -> None:
             self.db.set_setting("update_manifest_url", manifest_var.get().strip())
+            self.db.set_setting("auto_check_updates_on_startup", "1" if auto_check_var.get() else "0")
             self.result_label.config(text=self.t("update_settings_saved"), foreground="#0D6832")
             selector.destroy()
 
         save_btn = self.ttk.Button(frame, text=self.t("save_rule"), command=save_manifest_url)
-        save_btn.grid(row=2, column=0, sticky="e")
+        save_btn.grid(row=3, column=0, sticky="e")
 
-    def check_for_updates(self) -> None:
+    def auto_check_for_updates_on_startup(self) -> None:
+        if self.db.get_setting("auto_check_updates_on_startup", "0") != "1":
+            return
+        self.check_for_updates(silent=True)
+
+    def check_for_updates(self, silent: bool = False) -> None:
         if not self.update_manager.is_supported_environment():
+            if silent:
+                return
             self.messagebox.showwarning(self.t("warning"), self.t("update_not_supported"))
             return
 
         manifest_url = self.db.get_setting("update_manifest_url", "").strip()
         if not manifest_url:
+            if silent:
+                return
             self.messagebox.showwarning(self.t("warning"), self.t("update_manifest_missing"))
             return
 
         try:
             manifest = self.update_manager.fetch_manifest(manifest_url)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if silent:
+                return
             self.messagebox.showerror(self.t("warning"), self.t("update_check_failed", error=exc))
             return
 
@@ -4775,9 +4799,13 @@ class CourierApp:
         download_url = str(manifest.get("download_url", "")).strip()
         sha256_value = str(manifest.get("sha256", "")).strip() or None
         if not latest_version or not download_url:
+            if silent:
+                return
             self.messagebox.showerror(self.t("warning"), self.t("update_invalid_manifest"))
             return
         if not self.update_manager.is_newer_version(latest_version, APP_VERSION):
+            if silent:
+                return
             self.messagebox.showinfo(self.t("check_update"), self.t("update_latest"))
             return
 
