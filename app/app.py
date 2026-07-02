@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2723,14 +2723,44 @@ Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
                 raise ValueError("sha256_mismatch")
         return target_path
 
-    def create_windows_upgrade_script(self, current_exe: Path, new_exe: Path) -> Path:
+    def create_windows_upgrade_script(self, current_exe: Path, new_exe: Path, app_pid: int) -> Path:
+        self.update_dir.mkdir(parents=True, exist_ok=True)
         script_path = self.update_dir / "apply_update.bat"
         script_content = f"""@echo off
 setlocal
-timeout /t 2 /nobreak >nul
-copy /Y "{new_exe}" "{current_exe}" >nul
-start "" "{current_exe}"
-del "{new_exe}" >nul 2>nul
+set "APP_PID={app_pid}"
+set "NEW_EXE={new_exe}"
+set "CURRENT_EXE={current_exe}"
+set "WAIT_COUNT=0"
+set "COPY_COUNT=0"
+
+timeout /t 1 /nobreak >nul
+
+:wait_for_app_exit
+tasklist /FI "PID eq %APP_PID%" /NH 2>nul | findstr /I "%APP_PID%" >nul
+if errorlevel 1 goto copy_update
+set /a WAIT_COUNT+=1
+if %WAIT_COUNT% GEQ 8 goto force_close_app
+timeout /t 1 /nobreak >nul
+goto wait_for_app_exit
+
+:force_close_app
+taskkill /PID %APP_PID% /F >nul 2>nul
+timeout /t 1 /nobreak >nul
+
+:copy_update
+copy /Y "%NEW_EXE%" "%CURRENT_EXE%" >nul
+if not errorlevel 1 goto restart_app
+set /a COPY_COUNT+=1
+if %COPY_COUNT% GEQ 10 goto cleanup_script
+timeout /t 1 /nobreak >nul
+goto copy_update
+
+:restart_app
+start "" "%CURRENT_EXE%"
+del "%NEW_EXE%" >nul 2>nul
+
+:cleanup_script
 del "%~f0" >nul 2>nul
 """
         script_path.write_text(script_content, encoding="utf-8")
@@ -4682,14 +4712,25 @@ class CourierApp:
         try:
             downloaded_path = self.update_manager.download_update_package(download_url, sha256_value)
             current_exe = Path(sys.executable)
-            script_path = self.update_manager.create_windows_upgrade_script(current_exe, downloaded_path)
-            subprocess.Popen(["cmd", "/c", str(script_path)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            script_path = self.update_manager.create_windows_upgrade_script(current_exe, downloaded_path, os.getpid())
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(["cmd", "/c", str(script_path)], creationflags=creation_flags)
         except (OSError, ValueError) as exc:
             self.messagebox.showerror(self.t("warning"), self.t("update_download_failed", error=exc))
             return
 
-        self.messagebox.showinfo(self.t("check_update"), self.t("update_started"))
-        self.root.after(300, self.root.destroy)
+        self.force_exit_for_update()
+
+    def force_exit_for_update(self) -> None:
+        try:
+            self.db.close()
+        except (sqlite3.Error, OSError):
+            pass
+        try:
+            self.root.destroy()
+        except self.tk.TclError:
+            pass
+        os._exit(0)
 
     def open_backup_folder(self) -> None:
         try:
