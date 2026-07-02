@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.10"
+APP_VERSION = "1.2.11"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2731,14 +2731,17 @@ setlocal
 set "APP_PID={app_pid}"
 set "NEW_EXE={new_exe}"
 set "CURRENT_EXE={current_exe}"
+for %%I in ("%CURRENT_EXE%") do set "APP_DIR=%%~dpI"
+for %%I in ("%CURRENT_EXE%") do set "APP_NAME=%%~nxI"
 set "WAIT_COUNT=0"
+set "IMAGE_WAIT_COUNT=0"
 set "COPY_COUNT=0"
 
 timeout /t 1 /nobreak >nul
 
 :wait_for_app_exit
 tasklist /FI "PID eq %APP_PID%" /NH 2>nul | findstr /I "%APP_PID%" >nul
-if errorlevel 1 goto copy_update
+if errorlevel 1 goto wait_for_app_image_exit
 set /a WAIT_COUNT+=1
 if %WAIT_COUNT% GEQ 8 goto force_close_app
 timeout /t 1 /nobreak >nul
@@ -2747,6 +2750,18 @@ goto wait_for_app_exit
 :force_close_app
 taskkill /PID %APP_PID% /F >nul 2>nul
 timeout /t 1 /nobreak >nul
+
+:wait_for_app_image_exit
+tasklist /FI "IMAGENAME eq %APP_NAME%" /NH 2>nul | findstr /I "%APP_NAME%" >nul
+if errorlevel 1 goto copy_update
+set /a IMAGE_WAIT_COUNT+=1
+if %IMAGE_WAIT_COUNT% GEQ 6 goto force_close_app_image
+timeout /t 1 /nobreak >nul
+goto wait_for_app_image_exit
+
+:force_close_app_image
+taskkill /IM "%APP_NAME%" /F >nul 2>nul
+timeout /t 2 /nobreak >nul
 
 :copy_update
 copy /Y "%NEW_EXE%" "%CURRENT_EXE%" >nul
@@ -2757,7 +2772,9 @@ timeout /t 1 /nobreak >nul
 goto copy_update
 
 :restart_app
-start "" "%CURRENT_EXE%"
+rmdir /S /Q "%APP_DIR%.courier_runtime" >nul 2>nul
+timeout /t 3 /nobreak >nul
+start "" /D "%APP_DIR%" "%CURRENT_EXE%"
 del "%NEW_EXE%" >nul 2>nul
 
 :cleanup_script
