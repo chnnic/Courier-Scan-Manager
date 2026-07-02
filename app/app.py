@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -333,6 +333,7 @@ TRANSLATIONS = {
         "quick_block_recent_title": "最近加入的拦截单号",
         "duplicate_policy_label": "重复规则:",
         "sound_enabled_label": "提示音:",
+        "block_unrecognized_label": "拦截未设定快递公司",
         "scan_button": "确认录入",
         "waiting_scan": "等待扫描...",
         "recent_records": "最近扫描记录",
@@ -568,6 +569,7 @@ TRANSLATIONS = {
         "quick_block_recent_title": "Recently Added Intercepts",
         "duplicate_policy_label": "Duplicate Rule:",
         "sound_enabled_label": "Sound:",
+        "block_unrecognized_label": "Intercept unconfigured couriers",
         "scan_button": "Save Scan",
         "waiting_scan": "Waiting for scan...",
         "recent_records": "Recent Scan Records",
@@ -803,6 +805,7 @@ TRANSLATIONS = {
         "quick_block_recent_title": "Nomor Intersep Terbaru",
         "duplicate_policy_label": "Aturan Duplikat:",
         "sound_enabled_label": "Suara:",
+        "block_unrecognized_label": "Intersep kurir yang belum diatur",
         "scan_button": "Simpan Scan",
         "waiting_scan": "Menunggu pemindaian...",
         "recent_records": "Riwayat Pemindaian Terbaru",
@@ -1252,6 +1255,7 @@ class Database:
     def _initialize_settings(self) -> None:
         self.set_setting_if_missing("duplicate_policy", "all")
         self.set_setting_if_missing("sound_enabled", "1")
+        self.set_setting_if_missing("block_unrecognized_enabled", "0")
         self.set_setting_if_missing("operator_shortcuts", "")
         self.set_setting_if_missing("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)
         self.set_setting_if_missing("language_code", DEFAULT_LANGUAGE_CODE)
@@ -1297,6 +1301,12 @@ class Database:
 
     def set_sound_enabled(self, enabled: bool) -> None:
         self.set_setting("sound_enabled", "1" if enabled else "0")
+
+    def is_block_unrecognized_enabled(self) -> bool:
+        return self.get_setting("block_unrecognized_enabled", "0") == "1"
+
+    def set_block_unrecognized_enabled(self, enabled: bool) -> None:
+        self.set_setting("block_unrecognized_enabled", "1" if enabled else "0")
 
     def get_operator_shortcuts(self) -> list[str]:
         raw_value = self.get_setting("operator_shortcuts", "")
@@ -1602,6 +1612,19 @@ class Database:
                 "shipped_at": last_shipment["shipped_at"],
                 "operator_name": operator_name,
                 "anomaly_type": "",
+            }
+
+        company_id, company_name, company_color = self.resolve_company(normalized)
+        if company_id is None and self.is_block_unrecognized_enabled():
+            self.insert_anomaly_event(normalized, operator_name, "unrecognized", "")
+            return False, None, {
+                "tracking_number": normalized,
+                "company_name": company_name,
+                "company_color": company_color,
+                "shipped_at": "",
+                "operator_name": operator_name,
+                "anomaly_type": "unrecognized",
+                "notes": "",
             }
 
         _, new_shipment = self.insert_shipment(normalized, operator_name)
@@ -2076,6 +2099,13 @@ class MonthlyDatabaseManager:
         self.config_db.set_sound_enabled(enabled)
         self._sync_open_month_dbs()
 
+    def is_block_unrecognized_enabled(self) -> bool:
+        return self.config_db.is_block_unrecognized_enabled()
+
+    def set_block_unrecognized_enabled(self, enabled: bool) -> None:
+        self.config_db.set_block_unrecognized_enabled(enabled)
+        self._sync_open_month_dbs()
+
     def get_operator_shortcuts(self) -> list[str]:
         return self.config_db.get_operator_shortcuts()
 
@@ -2188,6 +2218,18 @@ class MonthlyDatabaseManager:
             }
 
         company_id, company_name, company_color = self.resolve_company(normalized)
+        if company_id is None and self.is_block_unrecognized_enabled():
+            self._current_db().insert_anomaly_event(normalized, operator_name, "unrecognized", "")
+            return False, None, {
+                "tracking_number": normalized,
+                "company_name": company_name,
+                "company_color": company_color,
+                "shipped_at": "",
+                "operator_name": operator_name,
+                "anomaly_type": "unrecognized",
+                "notes": "",
+            }
+
         shipped_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         shipping_day = datetime.now().strftime("%Y-%m-%d")
         current_db = self._current_db()
@@ -2649,6 +2691,7 @@ class CourierApp:
         self.stats_month_var = self.tk.StringVar(value=ALL_MONTHS_VALUE)
         self.duplicate_policy_var = self.tk.StringVar()
         self.sound_enabled_var = self.tk.StringVar()
+        self.block_unrecognized_var = self.tk.BooleanVar(value=False)
         self.backup_search_var = self.tk.StringVar()
         self.blocked_type_var = self.tk.StringVar()
         self.search_month_var = self.tk.StringVar(value=ALL_MONTHS_VALUE)
@@ -2665,6 +2708,7 @@ class CourierApp:
         self._build_archive_tab()
         self.load_duplicate_policy_setting()
         self.load_sound_setting()
+        self.load_block_unrecognized_setting()
         self.rebuild_operator_shortcut_buttons()
         self.backup_manager.create_daily_auto_backup()
         self.refresh_all_views()
@@ -2704,6 +2748,9 @@ class CourierApp:
 
     def sound_value_to_label(self, value: str) -> str:
         return self.sound_labels().get(value, self.t("sound_on"))
+
+    def load_block_unrecognized_setting(self) -> None:
+        self.block_unrecognized_var.set(self.db.is_block_unrecognized_enabled())
 
     def month_filter_options(self) -> list[str]:
         return [self.t("all_months")] + self.db.list_month_keys()
@@ -3016,6 +3063,14 @@ class CourierApp:
         )
         self.sound_enabled_combo.grid(row=4, column=3, sticky="ew", pady=(12, 0))
         self.sound_enabled_combo.bind("<<ComboboxSelected>>", self.on_sound_enabled_change)
+
+        self.block_unrecognized_check = self.ttk.Checkbutton(
+            self.input_frame,
+            text=self.t("block_unrecognized_label"),
+            variable=self.block_unrecognized_var,
+            command=self.on_block_unrecognized_change,
+        )
+        self.block_unrecognized_check.grid(row=5, column=0, columnspan=5, sticky="w", pady=(10, 0))
 
         self.scan_result_frame = self.ttk.Frame(top_frame)
         self.scan_result_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -3951,6 +4006,9 @@ class CourierApp:
     def on_sound_enabled_change(self, _event: Any) -> None:
         self.db.set_sound_enabled(self.sound_label_to_value(self.sound_enabled_var.get()) == "1")
 
+    def on_block_unrecognized_change(self) -> None:
+        self.db.set_block_unrecognized_enabled(bool(self.block_unrecognized_var.get()))
+
     def on_language_change(self, _event: Any) -> None:
         selected_label = self.language_var.get()
         for code, label in LANGUAGES.items():
@@ -3996,6 +4054,8 @@ class CourierApp:
         self.sound_enabled_label.config(text=self.t("sound_enabled_label"))
         self.sound_enabled_combo.configure(values=list(self.sound_labels().values()))
         self.load_sound_setting()
+        self.block_unrecognized_check.config(text=self.t("block_unrecognized_label"))
+        self.load_block_unrecognized_setting()
         self.scan_button.config(text=self.t("scan_button"))
         self.result_label.config(text=self.t("waiting_scan"))
         self.big_company_label.config(text=self.t("big_company_default"), foreground=UNRECOGNIZED_COLOR)
