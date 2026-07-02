@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.15"
+APP_VERSION = "1.2.16"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2586,7 +2586,7 @@ class ReportExporter:
         export_format: str = "csv",
     ) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%H%M%S") if report_tag else datetime.now().strftime("%Y%m%d_%H%M%S")
         file_suffix = f"{report_tag}_{timestamp}" if report_tag else timestamp
         normalized_format = "xls" if export_format.lower() == "xls" else "csv"
         summary_path = output_dir / f"courier_report_summary_{file_suffix}.{normalized_format}"
@@ -4812,6 +4812,11 @@ class CourierApp:
         self.export_daily_report(report_day)
 
     def export_daily_report(self, report_day: str) -> None:
+        normalized_report_day = self.parse_date_or_warn(report_day)
+        if normalized_report_day is None:
+            return
+        report_day = normalized_report_day
+        self.report_date_var.set(report_day)
         selected_month = month_key_from_date(report_day)
         report_tag = report_day.replace("-", "")
         try:
