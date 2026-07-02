@@ -7,19 +7,20 @@ import subprocess
 import json
 import hashlib
 import tempfile
+import threading
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.13"
+APP_VERSION = "1.2.14"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -474,6 +475,21 @@ TRANSLATIONS = {
         "export_failed_message": "报表写入失败:\n{error}",
         "export_success": "导出成功",
         "export_success_message": "汇总报表已导出到:\n{summary_path}\n\n明细报表已导出到:\n{detail_path}",
+        "telegram_settings_button": "Telegram 设置",
+        "telegram_settings_title": "Telegram 报告设置",
+        "telegram_enabled": "启用 Telegram 日报发送",
+        "telegram_targets_label": "Telegram 目标列表:",
+        "telegram_targets_hint": "每行一个目标，格式: 名称|BOT_TOKEN|CHAT_ID",
+        "telegram_send_text": "发送文字报告",
+        "telegram_send_files": "发送报表文件",
+        "telegram_send_daily_report": "发送到 Telegram",
+        "telegram_settings_saved": "Telegram 设置已保存。",
+        "telegram_not_configured": "Telegram 未启用或没有配置目标。",
+        "telegram_send_started": "Telegram 日报正在后台发送...",
+        "telegram_send_success": "Telegram 日报已发送。",
+        "telegram_send_failed": "Telegram 发送失败: {error}",
+        "telegram_daily_report_title": "日报表 {date}",
+        "telegram_daily_total": "总包裹数: {total}",
         "export_sheet_filtered_companies": "筛选公司数量",
         "export_sheet_daily_stats": "每日数量",
         "export_sheet_company_stats": "公司统计",
@@ -726,6 +742,21 @@ TRANSLATIONS = {
         "export_failed_message": "Failed to write report:\n{error}",
         "export_success": "Export Successful",
         "export_success_message": "Summary report exported to:\n{summary_path}\n\nDetail report exported to:\n{detail_path}",
+        "telegram_settings_button": "Telegram Settings",
+        "telegram_settings_title": "Telegram Report Settings",
+        "telegram_enabled": "Enable Telegram daily report sending",
+        "telegram_targets_label": "Telegram Targets:",
+        "telegram_targets_hint": "One target per line. Format: Name|BOT_TOKEN|CHAT_ID",
+        "telegram_send_text": "Send text report",
+        "telegram_send_files": "Send report files",
+        "telegram_send_daily_report": "Send to Telegram",
+        "telegram_settings_saved": "Telegram settings saved.",
+        "telegram_not_configured": "Telegram is not enabled or no target is configured.",
+        "telegram_send_started": "Sending Telegram daily report in the background...",
+        "telegram_send_success": "Telegram daily report sent.",
+        "telegram_send_failed": "Telegram send failed: {error}",
+        "telegram_daily_report_title": "Daily Report {date}",
+        "telegram_daily_total": "Total packages: {total}",
         "export_sheet_filtered_companies": "Filtered Courier Totals",
         "export_sheet_daily_stats": "Daily Totals",
         "export_sheet_company_stats": "Courier Statistics",
@@ -978,6 +1009,21 @@ TRANSLATIONS = {
         "export_failed_message": "Gagal menulis laporan:\n{error}",
         "export_success": "Ekspor Berhasil",
         "export_success_message": "Laporan ringkasan diekspor ke:\n{summary_path}\n\nLaporan detail diekspor ke:\n{detail_path}",
+        "telegram_settings_button": "Pengaturan Telegram",
+        "telegram_settings_title": "Pengaturan Laporan Telegram",
+        "telegram_enabled": "Aktifkan pengiriman laporan harian Telegram",
+        "telegram_targets_label": "Target Telegram:",
+        "telegram_targets_hint": "Satu target per baris. Format: Nama|BOT_TOKEN|CHAT_ID",
+        "telegram_send_text": "Kirim laporan teks",
+        "telegram_send_files": "Kirim file laporan",
+        "telegram_send_daily_report": "Kirim ke Telegram",
+        "telegram_settings_saved": "Pengaturan Telegram disimpan.",
+        "telegram_not_configured": "Telegram belum aktif atau target belum diatur.",
+        "telegram_send_started": "Laporan harian Telegram sedang dikirim di latar belakang...",
+        "telegram_send_success": "Laporan harian Telegram terkirim.",
+        "telegram_send_failed": "Gagal mengirim Telegram: {error}",
+        "telegram_daily_report_title": "Laporan Harian {date}",
+        "telegram_daily_total": "Total paket: {total}",
         "export_sheet_filtered_companies": "Total Kurir Terfilter",
         "export_sheet_daily_stats": "Total Harian",
         "export_sheet_company_stats": "Statistik Kurir",
@@ -1308,6 +1354,11 @@ class Database:
         self.set_setting_if_missing("operator_shortcuts", "")
         self.set_setting_if_missing("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)
         self.set_setting_if_missing("auto_check_updates_on_startup", "0")
+        self.set_setting_if_missing("telegram_enabled", "0")
+        self.set_setting_if_missing("telegram_targets", "")
+        self.set_setting_if_missing("telegram_send_text", "1")
+        self.set_setting_if_missing("telegram_send_files", "1")
+        self.set_setting_if_missing("telegram_send_daily_report", "0")
         self.set_setting_if_missing("language_code", DEFAULT_LANGUAGE_CODE)
 
     def set_setting_if_missing(self, key: str, value: str) -> None:
@@ -2828,6 +2879,57 @@ del "%~f0" >nul 2>nul
         return script_path
 
 
+class TelegramNotifier:
+    def __init__(self, timeout: int = 20) -> None:
+        self.timeout = timeout
+
+    def _api_url(self, token: str, method: str) -> str:
+        return f"https://api.telegram.org/bot{token}/{method}"
+
+    def send_message(self, token: str, chat_id: str, text: str) -> None:
+        payload = urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+        request = Request(
+            self._api_url(token, "sendMessage"),
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            response.read()
+
+    def send_document(self, token: str, chat_id: str, file_path: Path, caption: str = "") -> None:
+        boundary = f"----CourierScanManager{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        body = bytearray()
+
+        def add_field(name: str, value: str) -> None:
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+
+        add_field("chat_id", chat_id)
+        if caption:
+            add_field("caption", caption)
+
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="document"; filename="{file_path.name}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.extend(file_path.read_bytes())
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+        request = Request(
+            self._api_url(token, "sendDocument"),
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            response.read()
+
+
 class CourierApp:
     def __init__(self, root: Any, tk_mod: Any, ttk_mod: Any, messagebox_mod: Any) -> None:
         self.root = root
@@ -2840,6 +2942,7 @@ class CourierApp:
         self.exporter = ReportExporter(self.db, self.t)
         self.backup_manager = BackupManager(self.db, BACKUP_DIR)
         self.update_manager = UpdateManager(APP_DIR, UPDATE_DIR)
+        self.telegram_notifier = TelegramNotifier()
         self.selected_company_id: int | None = None
         self.backup_sort_descending = True
 
@@ -2875,6 +2978,7 @@ class CourierApp:
         self.end_date_var = self.tk.StringVar()
         self.report_date_var = self.tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         self.export_format_var = self.tk.StringVar(value="CSV")
+        self.telegram_send_daily_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_send_daily_report", "0") == "1")
         self.company_filter_var = self.tk.StringVar()
         self.stats_month_var = self.tk.StringVar(value=ALL_MONTHS_VALUE)
         self.duplicate_policy_var = self.tk.StringVar()
@@ -3560,7 +3664,20 @@ class CourierApp:
         self.export_today_btn = self.ttk.Button(self.daily_report_frame, text=self.t("export_today_report"), command=self.export_today_report)
         self.export_today_btn.grid(row=0, column=4, padx=(0, 8))
         self.export_selected_date_btn = self.ttk.Button(self.daily_report_frame, text=self.t("export_selected_date_report"), command=self.export_selected_date_report)
-        self.export_selected_date_btn.grid(row=0, column=5)
+        self.export_selected_date_btn.grid(row=0, column=5, padx=(0, 12))
+        self.telegram_send_daily_check = self.ttk.Checkbutton(
+            self.daily_report_frame,
+            text=self.t("telegram_send_daily_report"),
+            variable=self.telegram_send_daily_var,
+            command=self.save_telegram_daily_choice,
+        )
+        self.telegram_send_daily_check.grid(row=0, column=6, padx=(0, 8))
+        self.telegram_settings_btn = self.ttk.Button(
+            self.daily_report_frame,
+            text=self.t("telegram_settings_button"),
+            command=self.open_telegram_settings,
+        )
+        self.telegram_settings_btn.grid(row=0, column=7)
 
         self.daily_frame = self.ttk.LabelFrame(container, text=self.t("daily_stats"), padding=12)
         self.daily_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
@@ -4317,6 +4434,8 @@ class CourierApp:
         self.report_yesterday_btn.config(text=self.t("set_yesterday"))
         self.export_today_btn.config(text=self.t("export_today_report"))
         self.export_selected_date_btn.config(text=self.t("export_selected_date_report"))
+        self.telegram_send_daily_check.config(text=self.t("telegram_send_daily_report"))
+        self.telegram_settings_btn.config(text=self.t("telegram_settings_button"))
         self.refresh_month_filter_options()
         self.refresh_company_filter_options()
         self.daily_frame.config(text=self.t("daily_stats"))
@@ -4701,11 +4820,128 @@ class CourierApp:
             self.t("export_success"),
             self.t("export_success_message", summary_path=summary_path, detail_path=detail_path),
         )
+        if self.telegram_send_daily_var.get():
+            self.db.set_setting("telegram_send_daily_report", "1")
+            self.send_telegram_daily_report(report_day, selected_month, summary_path, detail_path)
 
     def reconnect_database(self) -> None:
         self.db = MonthlyDatabaseManager(CONFIG_DB_PATH, self.t)
         self.exporter = ReportExporter(self.db, self.t)
         self.backup_manager = BackupManager(self.db, BACKUP_DIR)
+
+    def save_telegram_daily_choice(self) -> None:
+        self.db.set_setting("telegram_send_daily_report", "1" if self.telegram_send_daily_var.get() else "0")
+
+    def parse_telegram_targets(self, raw_targets: str) -> list[dict[str, str]]:
+        targets: list[dict[str, str]] = []
+        for line in raw_targets.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [part.strip() for part in stripped.split("|")]
+            if len(parts) >= 3:
+                name, token, chat_id = parts[0], parts[1], parts[2]
+            elif len(parts) == 2:
+                name, token, chat_id = f"Telegram {len(targets) + 1}", parts[0], parts[1]
+            else:
+                continue
+            if token and chat_id:
+                targets.append({"name": name or f"Telegram {len(targets) + 1}", "token": token, "chat_id": chat_id})
+        return targets
+
+    def open_telegram_settings(self) -> None:
+        selector = self.tk.Toplevel(self.root)
+        selector.title(self.t("telegram_settings_title"))
+        selector.geometry("820x520")
+        selector.transient(self.root)
+        selector.grab_set()
+
+        frame = self.ttk.Frame(selector, padding=16)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
+
+        enabled_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_enabled", "0") == "1")
+        send_text_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_send_text", "1") == "1")
+        send_files_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_send_files", "1") == "1")
+
+        enabled_check = self.ttk.Checkbutton(frame, text=self.t("telegram_enabled"), variable=enabled_var)
+        enabled_check.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        send_text_check = self.ttk.Checkbutton(frame, text=self.t("telegram_send_text"), variable=send_text_var)
+        send_text_check.grid(row=1, column=0, sticky="w", pady=(0, 4))
+        send_files_check = self.ttk.Checkbutton(frame, text=self.t("telegram_send_files"), variable=send_files_var)
+        send_files_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
+
+        targets_label = self.ttk.Label(frame, text=self.t("telegram_targets_label"))
+        targets_label.grid(row=3, column=0, sticky="nw")
+        targets_text = self.tk.Text(frame, height=10, wrap="none")
+        targets_text.grid(row=4, column=0, sticky="nsew", pady=(8, 8))
+        targets_text.insert("1.0", self.db.get_setting("telegram_targets", ""))
+
+        hint_label = self.ttk.Label(frame, text=self.t("telegram_targets_hint"), foreground=UNRECOGNIZED_COLOR)
+        hint_label.grid(row=5, column=0, sticky="w", pady=(0, 12))
+
+        def save_telegram_settings() -> None:
+            self.db.set_setting("telegram_enabled", "1" if enabled_var.get() else "0")
+            self.db.set_setting("telegram_send_text", "1" if send_text_var.get() else "0")
+            self.db.set_setting("telegram_send_files", "1" if send_files_var.get() else "0")
+            self.db.set_setting("telegram_targets", targets_text.get("1.0", self.tk.END).strip())
+            self.result_label.config(text=self.t("telegram_settings_saved"), foreground="#0D6832")
+            selector.destroy()
+
+        save_btn = self.ttk.Button(frame, text=self.t("save_rule"), command=save_telegram_settings)
+        save_btn.grid(row=6, column=0, sticky="e")
+
+    def build_telegram_daily_message(self, report_day: str, selected_month: str) -> str:
+        company_rows = self.db.get_company_stats(report_day, report_day, None, selected_month)
+        total = sum(int(row["total"]) for row in company_rows)
+        lines = [
+            self.t("telegram_daily_report_title", date=report_day),
+            self.t("telegram_daily_total", total=total),
+            "",
+            self.t("company_totals") + ":",
+        ]
+        if company_rows:
+            lines.extend(f"- {row['company_name']}: {row['total']}" for row in company_rows)
+        else:
+            lines.append("- 0")
+        return "\n".join(lines)
+
+    def send_telegram_daily_report(self, report_day: str, selected_month: str, summary_path: Path, detail_path: Path) -> None:
+        if self.db.get_setting("telegram_enabled", "0") != "1":
+            self.messagebox.showwarning(self.t("warning"), self.t("telegram_not_configured"))
+            return
+        targets = self.parse_telegram_targets(self.db.get_setting("telegram_targets", ""))
+        if not targets:
+            self.messagebox.showwarning(self.t("warning"), self.t("telegram_not_configured"))
+            return
+
+        send_text = self.db.get_setting("telegram_send_text", "1") == "1"
+        send_files = self.db.get_setting("telegram_send_files", "1") == "1"
+        message = self.build_telegram_daily_message(report_day, selected_month)
+        files = [summary_path, detail_path]
+        self.result_label.config(text=self.t("telegram_send_started"), foreground="#0B5CAB")
+
+        def worker() -> None:
+            errors: list[str] = []
+            for target in targets:
+                try:
+                    if send_text:
+                        self.telegram_notifier.send_message(target["token"], target["chat_id"], message)
+                    if send_files:
+                        for file_path in files:
+                            self.telegram_notifier.send_document(target["token"], target["chat_id"], file_path, caption=file_path.name)
+                except Exception as exc:
+                    errors.append(f"{target['name']}: {exc}")
+            self.root.after(0, lambda: self.finish_telegram_send(errors))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_telegram_send(self, errors: list[str]) -> None:
+        if errors:
+            self.result_label.config(text=self.t("telegram_send_failed", error="; ".join(errors[:2])), foreground="#A61B1B")
+            return
+        self.result_label.config(text=self.t("telegram_send_success"), foreground="#0D6832")
 
     def format_backup_size(self, size_bytes: int) -> str:
         if size_bytes >= 1024 * 1024:
