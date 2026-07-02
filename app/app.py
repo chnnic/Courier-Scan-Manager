@@ -2,6 +2,7 @@ import csv
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import json
@@ -20,7 +21,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.14"
+APP_VERSION = "1.2.15"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -307,6 +308,10 @@ def normalize_language_code(value: str | None) -> str:
     code = (value or "").strip().lower()
     return code if code in LANGUAGES else DEFAULT_LANGUAGE_CODE
 
+
+def default_machine_name() -> str:
+    return socket.gethostname() or APP_NAME
+
 TRANSLATIONS = {
     "zh": {
         "app_title": "快递扫描发货管理系统",
@@ -478,6 +483,7 @@ TRANSLATIONS = {
         "telegram_settings_button": "Telegram 设置",
         "telegram_settings_title": "Telegram 报告设置",
         "telegram_enabled": "启用 Telegram 日报发送",
+        "telegram_machine_name_label": "推送主机名称:",
         "telegram_targets_label": "Telegram 目标列表:",
         "telegram_targets_hint": "每行一个目标，格式: 名称|BOT_TOKEN|CHAT_ID",
         "telegram_send_text": "发送文字报告",
@@ -489,6 +495,7 @@ TRANSLATIONS = {
         "telegram_send_success": "Telegram 日报已发送。",
         "telegram_send_failed": "Telegram 发送失败: {error}",
         "telegram_daily_report_title": "日报表 {date}",
+        "telegram_machine_name": "主机: {name}",
         "telegram_daily_total": "总包裹数: {total}",
         "export_sheet_filtered_companies": "筛选公司数量",
         "export_sheet_daily_stats": "每日数量",
@@ -745,6 +752,7 @@ TRANSLATIONS = {
         "telegram_settings_button": "Telegram Settings",
         "telegram_settings_title": "Telegram Report Settings",
         "telegram_enabled": "Enable Telegram daily report sending",
+        "telegram_machine_name_label": "Sender Machine Name:",
         "telegram_targets_label": "Telegram Targets:",
         "telegram_targets_hint": "One target per line. Format: Name|BOT_TOKEN|CHAT_ID",
         "telegram_send_text": "Send text report",
@@ -756,6 +764,7 @@ TRANSLATIONS = {
         "telegram_send_success": "Telegram daily report sent.",
         "telegram_send_failed": "Telegram send failed: {error}",
         "telegram_daily_report_title": "Daily Report {date}",
+        "telegram_machine_name": "Machine: {name}",
         "telegram_daily_total": "Total packages: {total}",
         "export_sheet_filtered_companies": "Filtered Courier Totals",
         "export_sheet_daily_stats": "Daily Totals",
@@ -1012,6 +1021,7 @@ TRANSLATIONS = {
         "telegram_settings_button": "Pengaturan Telegram",
         "telegram_settings_title": "Pengaturan Laporan Telegram",
         "telegram_enabled": "Aktifkan pengiriman laporan harian Telegram",
+        "telegram_machine_name_label": "Nama Mesin Pengirim:",
         "telegram_targets_label": "Target Telegram:",
         "telegram_targets_hint": "Satu target per baris. Format: Nama|BOT_TOKEN|CHAT_ID",
         "telegram_send_text": "Kirim laporan teks",
@@ -1023,6 +1033,7 @@ TRANSLATIONS = {
         "telegram_send_success": "Laporan harian Telegram terkirim.",
         "telegram_send_failed": "Gagal mengirim Telegram: {error}",
         "telegram_daily_report_title": "Laporan Harian {date}",
+        "telegram_machine_name": "Mesin: {name}",
         "telegram_daily_total": "Total paket: {total}",
         "export_sheet_filtered_companies": "Total Kurir Terfilter",
         "export_sheet_daily_stats": "Total Harian",
@@ -1355,6 +1366,7 @@ class Database:
         self.set_setting_if_missing("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)
         self.set_setting_if_missing("auto_check_updates_on_startup", "0")
         self.set_setting_if_missing("telegram_enabled", "0")
+        self.set_setting_if_missing("telegram_machine_name", default_machine_name())
         self.set_setting_if_missing("telegram_targets", "")
         self.set_setting_if_missing("telegram_send_text", "1")
         self.set_setting_if_missing("telegram_send_files", "1")
@@ -4859,11 +4871,12 @@ class CourierApp:
         frame = self.ttk.Frame(selector, padding=16)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(4, weight=1)
+        frame.rowconfigure(6, weight=1)
 
         enabled_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_enabled", "0") == "1")
         send_text_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_send_text", "1") == "1")
         send_files_var = self.tk.BooleanVar(value=self.db.get_setting("telegram_send_files", "1") == "1")
+        machine_name_var = self.tk.StringVar(value=self.db.get_setting("telegram_machine_name", default_machine_name()))
 
         enabled_check = self.ttk.Checkbutton(frame, text=self.t("telegram_enabled"), variable=enabled_var)
         enabled_check.grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -4872,17 +4885,23 @@ class CourierApp:
         send_files_check = self.ttk.Checkbutton(frame, text=self.t("telegram_send_files"), variable=send_files_var)
         send_files_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
 
+        machine_name_label = self.ttk.Label(frame, text=self.t("telegram_machine_name_label"))
+        machine_name_label.grid(row=3, column=0, sticky="w")
+        machine_name_entry = self.ttk.Entry(frame, textvariable=machine_name_var)
+        machine_name_entry.grid(row=4, column=0, sticky="ew", pady=(8, 12))
+
         targets_label = self.ttk.Label(frame, text=self.t("telegram_targets_label"))
-        targets_label.grid(row=3, column=0, sticky="nw")
+        targets_label.grid(row=5, column=0, sticky="nw")
         targets_text = self.tk.Text(frame, height=10, wrap="none")
-        targets_text.grid(row=4, column=0, sticky="nsew", pady=(8, 8))
+        targets_text.grid(row=6, column=0, sticky="nsew", pady=(8, 8))
         targets_text.insert("1.0", self.db.get_setting("telegram_targets", ""))
 
         hint_label = self.ttk.Label(frame, text=self.t("telegram_targets_hint"), foreground=UNRECOGNIZED_COLOR)
-        hint_label.grid(row=5, column=0, sticky="w", pady=(0, 12))
+        hint_label.grid(row=7, column=0, sticky="w", pady=(0, 12))
 
         def save_telegram_settings() -> None:
             self.db.set_setting("telegram_enabled", "1" if enabled_var.get() else "0")
+            self.db.set_setting("telegram_machine_name", machine_name_var.get().strip() or default_machine_name())
             self.db.set_setting("telegram_send_text", "1" if send_text_var.get() else "0")
             self.db.set_setting("telegram_send_files", "1" if send_files_var.get() else "0")
             self.db.set_setting("telegram_targets", targets_text.get("1.0", self.tk.END).strip())
@@ -4890,13 +4909,14 @@ class CourierApp:
             selector.destroy()
 
         save_btn = self.ttk.Button(frame, text=self.t("save_rule"), command=save_telegram_settings)
-        save_btn.grid(row=6, column=0, sticky="e")
+        save_btn.grid(row=8, column=0, sticky="e")
 
     def build_telegram_daily_message(self, report_day: str, selected_month: str) -> str:
         company_rows = self.db.get_company_stats(report_day, report_day, None, selected_month)
         total = sum(int(row["total"]) for row in company_rows)
         lines = [
             self.t("telegram_daily_report_title", date=report_day),
+            self.t("telegram_machine_name", name=self.db.get_setting("telegram_machine_name", default_machine_name())),
             self.t("telegram_daily_total", total=total),
             "",
             self.t("company_totals") + ":",
