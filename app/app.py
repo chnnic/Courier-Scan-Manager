@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -472,6 +472,14 @@ TRANSLATIONS = {
         "export_failed_message": "报表写入失败:\n{error}",
         "export_success": "导出成功",
         "export_success_message": "汇总报表已导出到:\n{summary_path}\n\n明细报表已导出到:\n{detail_path}",
+        "export_sheet_filtered_companies": "筛选公司数量",
+        "export_sheet_daily_stats": "每日数量",
+        "export_sheet_company_stats": "公司统计",
+        "export_sheet_operator_stats": "操作员统计",
+        "export_sheet_shipments": "发货明细",
+        "export_sheet_unrecognized": "未识别单号",
+        "export_color": "颜色",
+        "export_scanned_at": "扫描时间",
         "backup_data": "备份数据",
         "restore_data": "恢复数据",
         "check_update": "检查更新",
@@ -714,6 +722,14 @@ TRANSLATIONS = {
         "export_failed_message": "Failed to write report:\n{error}",
         "export_success": "Export Successful",
         "export_success_message": "Summary report exported to:\n{summary_path}\n\nDetail report exported to:\n{detail_path}",
+        "export_sheet_filtered_companies": "Filtered Courier Totals",
+        "export_sheet_daily_stats": "Daily Totals",
+        "export_sheet_company_stats": "Courier Statistics",
+        "export_sheet_operator_stats": "Operator Statistics",
+        "export_sheet_shipments": "Shipment Details",
+        "export_sheet_unrecognized": "Unrecognized Tracking Numbers",
+        "export_color": "Color",
+        "export_scanned_at": "Scanned Time",
         "backup_data": "Backup Data",
         "restore_data": "Restore Data",
         "check_update": "Check for Updates",
@@ -956,6 +972,14 @@ TRANSLATIONS = {
         "export_failed_message": "Gagal menulis laporan:\n{error}",
         "export_success": "Ekspor Berhasil",
         "export_success_message": "Laporan ringkasan diekspor ke:\n{summary_path}\n\nLaporan detail diekspor ke:\n{detail_path}",
+        "export_sheet_filtered_companies": "Total Kurir Terfilter",
+        "export_sheet_daily_stats": "Total Harian",
+        "export_sheet_company_stats": "Statistik Kurir",
+        "export_sheet_operator_stats": "Statistik Operator",
+        "export_sheet_shipments": "Detail Pengiriman",
+        "export_sheet_unrecognized": "Nomor Resi Tidak Dikenali",
+        "export_color": "Warna",
+        "export_scanned_at": "Waktu Pindai",
         "backup_data": "Cadangkan Data",
         "restore_data": "Pulihkan Data",
         "check_update": "Periksa Pembaruan",
@@ -2431,8 +2455,14 @@ class MonthlyDatabaseManager:
         return archive_path
 
 class ReportExporter:
-    def __init__(self, db: Any) -> None:
+    def __init__(self, db: Any, translate: Any | None = None) -> None:
         self.db = db
+        self.translate = translate
+
+    def _label(self, key: str) -> str:
+        if self.translate is None:
+            return key
+        return str(self.translate(key)).rstrip(":")
 
     def _sheet_xml(self, name: str, headers: list[str], rows: list[list[Any]]) -> str:
         header_cells = "".join(
@@ -2476,6 +2506,48 @@ class ReportExporter:
             for row in self.db.get_unrecognized_shipments(selected_month)
         ]
 
+        summary_sheets = [
+            self._sheet_xml(
+                self._label("export_sheet_filtered_companies"),
+                [self._label("company_name"), self._label("quantity")],
+                filtered_counts,
+            ),
+            self._sheet_xml(
+                self._label("export_sheet_daily_stats"),
+                [self._label("date"), self._label("package_total")],
+                daily_stats,
+            ),
+            self._sheet_xml(
+                self._label("export_sheet_company_stats"),
+                [self._label("company_name"), self._label("export_color"), self._label("cumulative_total")],
+                company_stats,
+            ),
+            self._sheet_xml(
+                self._label("export_sheet_operator_stats"),
+                [self._label("operator_label"), self._label("quantity")],
+                operator_stats,
+            ),
+        ]
+        detail_sheets = [
+            self._sheet_xml(
+                self._label("export_sheet_shipments"),
+                [
+                    self._label("tracking_number"),
+                    self._label("company_name"),
+                    self._label("export_color"),
+                    self._label("operator_label"),
+                    self._label("shipped_at"),
+                    self._label("shipping_day"),
+                ],
+                shipment_rows,
+            ),
+            self._sheet_xml(
+                self._label("export_sheet_unrecognized"),
+                [self._label("tracking_number"), self._label("operator_label"), self._label("export_scanned_at")],
+                unrecognized_rows,
+            ),
+        ]
+
         summary_workbook = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
  xmlns:o="urn:schemas-microsoft-com:office:office"
@@ -2487,10 +2559,7 @@ class ReportExporter:
    <Interior ss:Color="#D9EAF7" ss:Pattern="Solid"/>
   </Style>
  </Styles>
- {self._sheet_xml("筛选公司数量", ["快递公司", "数量"], filtered_counts)}
- {self._sheet_xml("每日数量", ["日期", "包裹数量"], daily_stats)}
- {self._sheet_xml("公司统计", ["快递公司", "颜色", "累计数量"], company_stats)}
- {self._sheet_xml("操作员统计", ["操作员", "数量"], operator_stats)}
+ {" ".join(summary_sheets)}
 </Workbook>
 """
         detail_workbook = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -2504,8 +2573,7 @@ class ReportExporter:
    <Interior ss:Color="#D9EAF7" ss:Pattern="Solid"/>
   </Style>
  </Styles>
- {self._sheet_xml("发货明细", ["快递单号", "快递公司", "颜色", "操作员", "发货时间", "发货日期"], shipment_rows)}
- {self._sheet_xml("未识别单号", ["快递单号", "操作员", "扫描时间"], unrecognized_rows)}
+ {" ".join(detail_sheets)}
 </Workbook>
 """
         summary_path.write_text(summary_workbook, encoding="utf-8")
@@ -2678,7 +2746,7 @@ class CourierApp:
         self.language_code = DEFAULT_LANGUAGE_CODE
         self.db = MonthlyDatabaseManager(CONFIG_DB_PATH, self.t)
         self.language_code = normalize_language_code(self.db.get_setting("language_code", DEFAULT_LANGUAGE_CODE))
-        self.exporter = ReportExporter(self.db)
+        self.exporter = ReportExporter(self.db, self.t)
         self.backup_manager = BackupManager(self.db, BACKUP_DIR)
         self.update_manager = UpdateManager(APP_DIR, UPDATE_DIR)
         self.selected_company_id: int | None = None
@@ -4516,7 +4584,7 @@ class CourierApp:
 
     def reconnect_database(self) -> None:
         self.db = MonthlyDatabaseManager(CONFIG_DB_PATH, self.t)
-        self.exporter = ReportExporter(self.db)
+        self.exporter = ReportExporter(self.db, self.t)
         self.backup_manager = BackupManager(self.db, BACKUP_DIR)
 
     def format_backup_size(self, size_bytes: int) -> str:
