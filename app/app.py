@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -352,6 +352,12 @@ TRANSLATIONS = {
         "stats_title": "发货统计",
         "refresh_stats": "刷新统计",
         "export_excel": "导出 Excel 报表",
+        "daily_report_title": "日报表导出",
+        "report_date_label": "报表日期:",
+        "set_today": "今天",
+        "set_yesterday": "昨天",
+        "export_today_report": "导出今日报表",
+        "export_selected_date_report": "导出指定日期报表",
         "start_date_label": "开始日期:",
         "end_date_label": "结束日期:",
         "company_filter_label": "快递公司筛选:",
@@ -588,6 +594,12 @@ TRANSLATIONS = {
         "stats_title": "Shipping Statistics",
         "refresh_stats": "Refresh",
         "export_excel": "Export Excel Report",
+        "daily_report_title": "Daily Report Export",
+        "report_date_label": "Report Date:",
+        "set_today": "Today",
+        "set_yesterday": "Yesterday",
+        "export_today_report": "Export Today's Report",
+        "export_selected_date_report": "Export Selected Date",
         "start_date_label": "Start Date:",
         "end_date_label": "End Date:",
         "company_filter_label": "Courier Filter:",
@@ -824,6 +836,12 @@ TRANSLATIONS = {
         "stats_title": "Statistik Pengiriman",
         "refresh_stats": "Muat Ulang",
         "export_excel": "Ekspor Laporan Excel",
+        "daily_report_title": "Ekspor Laporan Harian",
+        "report_date_label": "Tanggal Laporan:",
+        "set_today": "Hari Ini",
+        "set_yesterday": "Kemarin",
+        "export_today_report": "Ekspor Hari Ini",
+        "export_selected_date_report": "Ekspor Tanggal Pilihan",
         "start_date_label": "Tanggal Mulai:",
         "end_date_label": "Tanggal Akhir:",
         "company_filter_label": "Filter Kurir:",
@@ -2437,11 +2455,13 @@ class ReportExporter:
         end_day: str | None = None,
         company_name: str | None = None,
         selected_month: str | None = None,
+        report_tag: str | None = None,
     ) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        summary_path = output_dir / f"courier_report_summary_{timestamp}.xls"
-        detail_path = output_dir / f"courier_report_detail_{timestamp}.xls"
+        file_suffix = f"{report_tag}_{timestamp}" if report_tag else timestamp
+        summary_path = output_dir / f"courier_report_summary_{file_suffix}.xls"
+        detail_path = output_dir / f"courier_report_detail_{file_suffix}.xls"
 
         filtered_counts = [[row["company_name"], row["total"]] for row in self.db.get_company_stats(start_day, end_day, company_name, selected_month)]
         daily_stats = [[row["shipping_day"], row["total"]] for row in self.db.get_daily_stats(start_day, end_day, company_name, selected_month)]
@@ -2687,6 +2707,7 @@ class CourierApp:
         self.operator_var = self.tk.StringVar()
         self.start_date_var = self.tk.StringVar()
         self.end_date_var = self.tk.StringVar()
+        self.report_date_var = self.tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         self.company_filter_var = self.tk.StringVar()
         self.stats_month_var = self.tk.StringVar(value=ALL_MONTHS_VALUE)
         self.duplicate_policy_var = self.tk.StringVar()
@@ -3281,9 +3302,10 @@ class CourierApp:
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
-        container.rowconfigure(2, weight=1)
+        container.rowconfigure(2, weight=0)
         container.rowconfigure(3, weight=1)
         container.rowconfigure(4, weight=1)
+        container.rowconfigure(5, weight=1)
 
         self.stats_header = self.ttk.Label(container, text=self.t("stats_title"), font=("Microsoft YaHei UI", 20, "bold"))
         self.stats_header.grid(row=0, column=0, sticky="w")
@@ -3341,8 +3363,25 @@ class CourierApp:
         self.reset_filter_btn = self.ttk.Button(self.filter_frame, text=self.t("reset_filter"), command=self.reset_stats_filter)
         self.reset_filter_btn.grid(row=0, column=9)
 
+        self.daily_report_frame = self.ttk.LabelFrame(container, text=self.t("daily_report_title"), padding=12)
+        self.daily_report_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self.daily_report_frame.columnconfigure(1, weight=1)
+
+        self.report_date_label = self.ttk.Label(self.daily_report_frame, text=self.t("report_date_label"))
+        self.report_date_label.grid(row=0, column=0, sticky="w")
+        self.report_date_entry = self.ttk.Entry(self.daily_report_frame, textvariable=self.report_date_var, width=14)
+        self.report_date_entry.grid(row=0, column=1, sticky="w", padx=(8, 8))
+        self.report_today_btn = self.ttk.Button(self.daily_report_frame, text=self.t("set_today"), command=self.set_report_date_today)
+        self.report_today_btn.grid(row=0, column=2, padx=(0, 8))
+        self.report_yesterday_btn = self.ttk.Button(self.daily_report_frame, text=self.t("set_yesterday"), command=self.set_report_date_yesterday)
+        self.report_yesterday_btn.grid(row=0, column=3, padx=(0, 16))
+        self.export_today_btn = self.ttk.Button(self.daily_report_frame, text=self.t("export_today_report"), command=self.export_today_report)
+        self.export_today_btn.grid(row=0, column=4, padx=(0, 8))
+        self.export_selected_date_btn = self.ttk.Button(self.daily_report_frame, text=self.t("export_selected_date_report"), command=self.export_selected_date_report)
+        self.export_selected_date_btn.grid(row=0, column=5)
+
         self.daily_frame = self.ttk.LabelFrame(container, text=self.t("daily_stats"), padding=12)
-        self.daily_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
+        self.daily_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
         self.daily_frame.rowconfigure(0, weight=1)
         self.daily_frame.columnconfigure(0, weight=1)
 
@@ -3358,7 +3397,7 @@ class CourierApp:
         self.daily_tree.configure(yscrollcommand=daily_scroll.set)
 
         self.company_frame = self.ttk.LabelFrame(container, text=self.t("company_totals"), padding=12)
-        self.company_frame.grid(row=2, column=1, sticky="nsew", padx=(8, 0), pady=(16, 0))
+        self.company_frame.grid(row=3, column=1, sticky="nsew", padx=(8, 0), pady=(16, 0))
         self.company_frame.rowconfigure(0, weight=1)
         self.company_frame.columnconfigure(0, weight=1)
 
@@ -3374,7 +3413,7 @@ class CourierApp:
         self.stats_company_tree.configure(yscrollcommand=company_scroll.set)
 
         self.operator_frame = self.ttk.LabelFrame(container, text=self.t("operator_totals"), padding=12)
-        self.operator_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
+        self.operator_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
         self.operator_frame.rowconfigure(0, weight=1)
         self.operator_frame.columnconfigure(0, weight=1)
 
@@ -3390,7 +3429,7 @@ class CourierApp:
         self.operator_tree.configure(yscrollcommand=operator_scroll.set)
 
         self.backup_frame = self.ttk.LabelFrame(container, text=self.t("backup_management"), padding=12)
-        self.backup_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
+        self.backup_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
         self.backup_frame.rowconfigure(1, weight=1)
         self.backup_frame.columnconfigure(0, weight=1)
 
@@ -4089,6 +4128,12 @@ class CourierApp:
         self.company_filter_label.config(text=self.t("company_filter_label"))
         self.apply_filter_btn.config(text=self.t("apply_filter"))
         self.reset_filter_btn.config(text=self.t("reset_filter"))
+        self.daily_report_frame.config(text=self.t("daily_report_title"))
+        self.report_date_label.config(text=self.t("report_date_label"))
+        self.report_today_btn.config(text=self.t("set_today"))
+        self.report_yesterday_btn.config(text=self.t("set_yesterday"))
+        self.export_today_btn.config(text=self.t("export_today_report"))
+        self.export_selected_date_btn.config(text=self.t("export_selected_date_report"))
         self.refresh_month_filter_options()
         self.refresh_company_filter_options()
         self.daily_frame.config(text=self.t("daily_stats"))
@@ -4412,6 +4457,47 @@ class CourierApp:
 
         try:
             summary_path, detail_path = self.exporter.export_report(EXPORT_DIR, start_day, end_day, company_name, selected_month)
+        except OSError as exc:
+            self.messagebox.showerror(self.t("export_failed"), self.t("export_failed_message", error=exc))
+            return
+
+        self.messagebox.showinfo(
+            self.t("export_success"),
+            self.t("export_success_message", summary_path=summary_path, detail_path=detail_path),
+        )
+
+    def set_report_date_today(self) -> None:
+        self.report_date_var.set(datetime.now().strftime("%Y-%m-%d"))
+
+    def set_report_date_yesterday(self) -> None:
+        self.report_date_var.set((datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    def export_today_report(self) -> None:
+        report_day = datetime.now().strftime("%Y-%m-%d")
+        self.report_date_var.set(report_day)
+        self.export_daily_report(report_day)
+
+    def export_selected_date_report(self) -> None:
+        if not self.report_date_var.get().strip():
+            self.messagebox.showwarning(self.t("warning"), self.t("invalid_date"))
+            return
+        report_day = self.parse_date_or_warn(self.report_date_var.get())
+        if report_day is None:
+            return
+        self.export_daily_report(report_day)
+
+    def export_daily_report(self, report_day: str) -> None:
+        selected_month = month_key_from_date(report_day)
+        report_tag = report_day.replace("-", "")
+        try:
+            summary_path, detail_path = self.exporter.export_report(
+                EXPORT_DIR,
+                report_day,
+                report_day,
+                None,
+                selected_month,
+                report_tag=report_tag,
+            )
         except OSError as exc:
             self.messagebox.showerror(self.t("export_failed"), self.t("export_failed_message", error=exc))
             return
