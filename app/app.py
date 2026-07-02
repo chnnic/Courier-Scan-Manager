@@ -18,7 +18,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -2562,9 +2562,12 @@ class UpdateManager:
         return sys.platform.startswith("win") and getattr(sys, "frozen", False)
 
     def run_powershell(self, script: str, *args: str) -> bytes:
+        self.update_dir.mkdir(parents=True, exist_ok=True)
+        script_path = self.update_dir / f"powershell_task_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.ps1"
+        script_path.write_text(script, encoding="utf-8")
         try:
             completed = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, *args],
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), *args],
                 check=True,
                 capture_output=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -2572,14 +2575,17 @@ class UpdateManager:
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode("utf-8", errors="replace").strip()
             raise OSError(stderr or str(exc)) from exc
+        finally:
+            script_path.unlink(missing_ok=True)
         return completed.stdout
 
     def fetch_text_with_powershell(self, url: str) -> str:
         script = """
+param([string]$Url)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$response = Invoke-WebRequest -UseBasicParsing -Uri $args[0]
+$response = Invoke-WebRequest -UseBasicParsing -Uri $Url
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::Write($response.Content)
 """
@@ -2587,10 +2593,11 @@ $response = Invoke-WebRequest -UseBasicParsing -Uri $args[0]
 
     def download_file_with_powershell(self, url: str, target_path: Path) -> None:
         script = """
+param([string]$Url, [string]$OutputPath)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -UseBasicParsing -Uri $args[0] -OutFile $args[1]
+Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
 """
         self.run_powershell(script, url, str(target_path))
 
