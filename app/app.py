@@ -1,3 +1,4 @@
+import csv
 import os
 import re
 import shutil
@@ -18,7 +19,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.11"
+APP_VERSION = "1.2.12"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -351,7 +352,8 @@ TRANSLATIONS = {
         "remove": "移除",
         "stats_title": "发货统计",
         "refresh_stats": "刷新统计",
-        "export_excel": "导出 Excel 报表",
+        "export_excel": "导出报表",
+        "export_format_label": "导出格式:",
         "daily_report_title": "日报表导出",
         "report_date_label": "报表日期:",
         "set_today": "今天",
@@ -601,7 +603,8 @@ TRANSLATIONS = {
         "remove": "Remove",
         "stats_title": "Shipping Statistics",
         "refresh_stats": "Refresh",
-        "export_excel": "Export Excel Report",
+        "export_excel": "Export Report",
+        "export_format_label": "Export Format:",
         "daily_report_title": "Daily Report Export",
         "report_date_label": "Report Date:",
         "set_today": "Today",
@@ -851,7 +854,8 @@ TRANSLATIONS = {
         "remove": "Hapus Cepat",
         "stats_title": "Statistik Pengiriman",
         "refresh_stats": "Muat Ulang",
-        "export_excel": "Ekspor Laporan Excel",
+        "export_excel": "Ekspor Laporan",
+        "export_format_label": "Format Ekspor:",
         "daily_report_title": "Ekspor Laporan Harian",
         "report_date_label": "Tanggal Laporan:",
         "set_today": "Hari Ini",
@@ -2478,6 +2482,32 @@ class ReportExporter:
             xml_rows.append("<Row>" + "".join(cells) + "</Row>")
         return f'<Worksheet ss:Name="{escape(name)}"><Table>{"".join(xml_rows)}</Table></Worksheet>'
 
+    def _csv_cell(self, value: Any, force_text: bool = False) -> str:
+        text = "" if value is None else str(value)
+        if force_text and text:
+            text = "\t" + text
+        if text.startswith(("=", "+", "-", "@")):
+            text = "'" + text
+        return text
+
+    def _write_csv_report(self, path: Path, sections: list[tuple[str, list[str], list[list[Any]]]]) -> None:
+        tracking_header = self._label("tracking_number")
+        with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            for section_index, (section_name, headers, rows) in enumerate(sections):
+                if section_index:
+                    writer.writerow([])
+                writer.writerow([section_name])
+                writer.writerow(headers)
+                tracking_indexes = {index for index, header in enumerate(headers) if header == tracking_header}
+                for row in rows:
+                    writer.writerow(
+                        [
+                            self._csv_cell(value, force_text=index in tracking_indexes)
+                            for index, value in enumerate(row)
+                        ]
+                    )
+
     def export_report(
         self,
         output_dir: Path,
@@ -2486,12 +2516,14 @@ class ReportExporter:
         company_name: str | None = None,
         selected_month: str | None = None,
         report_tag: str | None = None,
+        export_format: str = "csv",
     ) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_suffix = f"{report_tag}_{timestamp}" if report_tag else timestamp
-        summary_path = output_dir / f"courier_report_summary_{file_suffix}.xls"
-        detail_path = output_dir / f"courier_report_detail_{file_suffix}.xls"
+        normalized_format = "xls" if export_format.lower() == "xls" else "csv"
+        summary_path = output_dir / f"courier_report_summary_{file_suffix}.{normalized_format}"
+        detail_path = output_dir / f"courier_report_detail_{file_suffix}.{normalized_format}"
 
         filtered_counts = [[row["company_name"], row["total"]] for row in self.db.get_company_stats(start_day, end_day, company_name, selected_month)]
         daily_stats = [[row["shipping_day"], row["total"]] for row in self.db.get_daily_stats(start_day, end_day, company_name, selected_month)]
@@ -2506,30 +2538,30 @@ class ReportExporter:
             for row in self.db.get_unrecognized_shipments(selected_month)
         ]
 
-        summary_sheets = [
-            self._sheet_xml(
+        summary_sections = [
+            (
                 self._label("export_sheet_filtered_companies"),
                 [self._label("company_name"), self._label("quantity")],
                 filtered_counts,
             ),
-            self._sheet_xml(
+            (
                 self._label("export_sheet_daily_stats"),
                 [self._label("date"), self._label("package_total")],
                 daily_stats,
             ),
-            self._sheet_xml(
+            (
                 self._label("export_sheet_company_stats"),
                 [self._label("company_name"), self._label("export_color"), self._label("cumulative_total")],
                 company_stats,
             ),
-            self._sheet_xml(
+            (
                 self._label("export_sheet_operator_stats"),
                 [self._label("operator_label"), self._label("quantity")],
                 operator_stats,
             ),
         ]
-        detail_sheets = [
-            self._sheet_xml(
+        detail_sections = [
+            (
                 self._label("export_sheet_shipments"),
                 [
                     self._label("tracking_number"),
@@ -2541,12 +2573,20 @@ class ReportExporter:
                 ],
                 shipment_rows,
             ),
-            self._sheet_xml(
+            (
                 self._label("export_sheet_unrecognized"),
                 [self._label("tracking_number"), self._label("operator_label"), self._label("export_scanned_at")],
                 unrecognized_rows,
             ),
         ]
+
+        if normalized_format == "csv":
+            self._write_csv_report(summary_path, summary_sections)
+            self._write_csv_report(detail_path, detail_sections)
+            return summary_path, detail_path
+
+        summary_sheets = [self._sheet_xml(name, headers, rows) for name, headers, rows in summary_sections]
+        detail_sheets = [self._sheet_xml(name, headers, rows) for name, headers, rows in detail_sections]
 
         summary_workbook = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
@@ -2830,6 +2870,7 @@ class CourierApp:
         self.start_date_var = self.tk.StringVar()
         self.end_date_var = self.tk.StringVar()
         self.report_date_var = self.tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        self.export_format_var = self.tk.StringVar(value="CSV")
         self.company_filter_var = self.tk.StringVar()
         self.stats_month_var = self.tk.StringVar(value=ALL_MONTHS_VALUE)
         self.duplicate_policy_var = self.tk.StringVar()
@@ -3441,20 +3482,31 @@ class CourierApp:
         self.refresh_btn = self.ttk.Button(self.stats_action_frame, text=self.t("refresh_stats"), command=self.refresh_stats_tab)
         self.refresh_btn.grid(row=0, column=0, padx=(0, 8))
 
+        self.export_format_label = self.ttk.Label(self.stats_action_frame, text=self.t("export_format_label"))
+        self.export_format_label.grid(row=0, column=1, padx=(0, 6))
+        self.export_format_combo = self.ttk.Combobox(
+            self.stats_action_frame,
+            textvariable=self.export_format_var,
+            values=("CSV", "XLS"),
+            width=5,
+            state="readonly",
+        )
+        self.export_format_combo.grid(row=0, column=2, padx=(0, 8))
+
         self.export_btn = self.ttk.Button(self.stats_action_frame, text=self.t("export_excel"), command=self.export_excel_report)
-        self.export_btn.grid(row=0, column=1)
+        self.export_btn.grid(row=0, column=3)
 
         self.backup_btn = self.ttk.Button(self.stats_action_frame, text=self.t("backup_data"), command=self.backup_database)
-        self.backup_btn.grid(row=0, column=2, padx=(8, 8))
+        self.backup_btn.grid(row=0, column=4, padx=(8, 8))
 
         self.restore_btn = self.ttk.Button(self.stats_action_frame, text=self.t("restore_data"), command=self.restore_database)
-        self.restore_btn.grid(row=0, column=3)
+        self.restore_btn.grid(row=0, column=5)
 
         self.check_update_btn = self.ttk.Button(self.stats_action_frame, text=self.t("check_update"), command=self.check_for_updates)
-        self.check_update_btn.grid(row=0, column=4, padx=(8, 8))
+        self.check_update_btn.grid(row=0, column=6, padx=(8, 8))
 
         self.update_settings_btn = self.ttk.Button(self.stats_action_frame, text=self.t("update_settings_button"), command=self.open_update_settings)
-        self.update_settings_btn.grid(row=0, column=5)
+        self.update_settings_btn.grid(row=0, column=7)
 
         self.filter_frame = self.ttk.LabelFrame(container, text=self.t("search_frame"), padding=12)
         self.filter_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(16, 0))
@@ -4241,6 +4293,7 @@ class CourierApp:
 
         self.stats_header.config(text=self.t("stats_title"))
         self.refresh_btn.config(text=self.t("refresh_stats"))
+        self.export_format_label.config(text=self.t("export_format_label"))
         self.export_btn.config(text=self.t("export_excel"))
         self.backup_btn.config(text=self.t("backup_data"))
         self.restore_btn.config(text=self.t("restore_data"))
@@ -4581,7 +4634,14 @@ class CourierApp:
         selected_month = self.month_label_to_value(self.stats_month_var.get().strip())
 
         try:
-            summary_path, detail_path = self.exporter.export_report(EXPORT_DIR, start_day, end_day, company_name, selected_month)
+            summary_path, detail_path = self.exporter.export_report(
+                EXPORT_DIR,
+                start_day,
+                end_day,
+                company_name,
+                selected_month,
+                export_format=self.selected_export_format(),
+            )
         except OSError as exc:
             self.messagebox.showerror(self.t("export_failed"), self.t("export_failed_message", error=exc))
             return
@@ -4593,6 +4653,10 @@ class CourierApp:
 
     def set_report_date_today(self) -> None:
         self.report_date_var.set(datetime.now().strftime("%Y-%m-%d"))
+
+    def selected_export_format(self) -> str:
+        selected = self.export_format_var.get().strip().lower()
+        return "xls" if selected == "xls" else "csv"
 
     def set_report_date_yesterday(self) -> None:
         self.report_date_var.set((datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"))
@@ -4622,6 +4686,7 @@ class CourierApp:
                 None,
                 selected_month,
                 report_tag=report_tag,
+                export_format=self.selected_export_format(),
             )
         except OSError as exc:
             self.messagebox.showerror(self.t("export_failed"), self.t("export_failed_message", error=exc))
