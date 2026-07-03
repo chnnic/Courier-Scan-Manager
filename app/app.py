@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.16"
+APP_VERSION = "1.2.17"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
@@ -576,6 +576,8 @@ TRANSLATIONS = {
         "delete_record_title": "删除记录",
         "delete_record_message": "确定要删除这个最近扫描记录吗？",
         "record_deleted": "扫描记录已删除。",
+        "delete_tracking_record_message": "确定要从数据库删除这个单号记录吗？",
+        "tracking_record_deleted": "单号记录已从数据库删除。",
         "delete_confirm_title": "确认删除",
         "delete_confirm_message": "删除后将不再识别该规则，是否继续？",
         "rule_deleted": "规则已删除。",
@@ -845,6 +847,8 @@ TRANSLATIONS = {
         "delete_record_title": "Delete Record",
         "delete_record_message": "Are you sure you want to delete this recent scan record?",
         "record_deleted": "Scan record deleted.",
+        "delete_tracking_record_message": "Are you sure you want to delete this tracking record from the database?",
+        "tracking_record_deleted": "Tracking record deleted from the database.",
         "delete_confirm_title": "Confirm Delete",
         "delete_confirm_message": "This rule will no longer be used for recognition. Continue?",
         "rule_deleted": "Rule deleted.",
@@ -1114,6 +1118,8 @@ TRANSLATIONS = {
         "delete_record_title": "Hapus Data",
         "delete_record_message": "Yakin ingin menghapus riwayat scan ini?",
         "record_deleted": "Riwayat scan dihapus.",
+        "delete_tracking_record_message": "Yakin ingin menghapus data resi ini dari database?",
+        "tracking_record_deleted": "Data resi dihapus dari database.",
         "delete_confirm_title": "Konfirmasi Hapus",
         "delete_confirm_message": "Aturan ini tidak akan dipakai lagi untuk pengenalan. Lanjutkan?",
         "rule_deleted": "Aturan dihapus.",
@@ -1989,7 +1995,7 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT tracking_number, company_name, operator_name, shipped_at, shipping_day
+            SELECT id, tracking_number, company_name, operator_name, shipped_at, shipping_day
             FROM shipments
             WHERE tracking_number = ?
             ORDER BY shipped_at DESC
@@ -2488,6 +2494,12 @@ class MonthlyDatabaseManager:
 
     def delete_shipment(self, shipment_id: int) -> None:
         self._current_db().delete_shipment(shipment_id)
+
+    def delete_shipment_from_month(self, shipment_id: int, month_key: str | None) -> None:
+        if month_key:
+            self._ensure_month_db(month_key).delete_shipment(shipment_id)
+            return
+        self.delete_shipment(shipment_id)
 
     def get_all_shipments(
         self,
@@ -3858,7 +3870,7 @@ class CourierApp:
 
         self.search_tree = self.ttk.Treeview(
             self.result_frame,
-            columns=("tracking_number", "company_name", "operator_name", "shipped_at", "shipping_day"),
+            columns=("tracking_number", "company_name", "operator_name", "shipped_at", "shipping_day", "action"),
             show="headings",
         )
         self.search_tree.heading("tracking_number", text=self.t("tracking_number").rstrip(":"))
@@ -3866,12 +3878,15 @@ class CourierApp:
         self.search_tree.heading("operator_name", text=self.t("operator_label").rstrip(":"))
         self.search_tree.heading("shipped_at", text=self.t("shipped_at"))
         self.search_tree.heading("shipping_day", text=self.t("shipping_day"))
+        self.search_tree.heading("action", text=self.t("action"))
         self.search_tree.column("tracking_number", width=220)
         self.search_tree.column("company_name", width=140)
         self.search_tree.column("operator_name", width=120)
         self.search_tree.column("shipped_at", width=180)
         self.search_tree.column("shipping_day", width=120)
+        self.search_tree.column("action", width=90, anchor="center")
         self.search_tree.grid(row=0, column=0, sticky="nsew")
+        self.search_tree.bind("<ButtonRelease-1>", self.handle_search_tree_click)
 
         search_scroll = self.ttk.Scrollbar(self.result_frame, orient="vertical", command=self.search_tree.yview)
         search_scroll.grid(row=0, column=1, sticky="ns")
@@ -4485,6 +4500,7 @@ class CourierApp:
         self.search_tree.heading("operator_name", text=self.t("operator_label").rstrip(":"))
         self.search_tree.heading("shipped_at", text=self.t("shipped_at"))
         self.search_tree.heading("shipping_day", text=self.t("shipping_day"))
+        self.search_tree.heading("action", text=self.t("action"))
 
         self.rules_left.config(text=self.t("rules_title"))
         self.rules_right.config(text=self.t("rules_editor"))
@@ -5328,7 +5344,15 @@ class CourierApp:
             self.search_tree.insert(
                 "",
                 "end",
-                values=(row["tracking_number"], row["company_name"], display_operator, row["shipped_at"], row["shipping_day"]),
+                iid=f"{row['month_key']}|{row['id']}",
+                values=(
+                    row["tracking_number"],
+                    row["company_name"],
+                    display_operator,
+                    row["shipped_at"],
+                    row["shipping_day"],
+                    self.t("delete"),
+                ),
             )
         self.search_status.config(text=self.t("search_found", count=len(rows), time=rows[0]["shipped_at"]), foreground="#0D6832")
 
@@ -5406,6 +5430,28 @@ class CourierApp:
 
         self.db.delete_shipment(int(item_id))
         self.result_label.config(text=self.t("record_deleted"), foreground="#A61B1B")
+        self.refresh_scan_tab()
+        self.refresh_stats_tab()
+        self.refresh_unrecognized_tab()
+
+    def handle_search_tree_click(self, event: Any) -> None:
+        item_key = self.search_tree.identify_row(event.y)
+        column_id = self.search_tree.identify_column(event.x)
+        if not item_key or column_id != "#6":
+            return
+
+        try:
+            month_key, shipment_id = item_key.rsplit("|", 1)
+        except ValueError:
+            return
+
+        should_delete = self.messagebox.askyesno(self.t("delete_record_title"), self.t("delete_tracking_record_message"))
+        if not should_delete:
+            return
+
+        self.db.delete_shipment_from_month(int(shipment_id), month_key)
+        self.run_tracking_search()
+        self.search_status.config(text=self.t("tracking_record_deleted"), foreground="#A61B1B")
         self.refresh_scan_tab()
         self.refresh_stats_tab()
         self.refresh_unrecognized_tab()
