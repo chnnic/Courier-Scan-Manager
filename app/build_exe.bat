@@ -1,7 +1,7 @@
 @echo off
 cd /d %~dp0
 python -m pip install --upgrade pip
-python -m pip install pyinstaller
+python -m pip install pyinstaller==6.21.0
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 pyinstaller --noconsole --onefile --runtime-tmpdir .courier_runtime --name CourierScanManager app.py

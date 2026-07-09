@@ -10,6 +10,7 @@ import hashlib
 import tempfile
 import threading
 import zipfile
+import queue
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,11 +22,13 @@ from xml.sax.saxutils import escape
 
 
 APP_NAME = "CourierScanManager"
-APP_VERSION = "1.2.17"
+APP_VERSION = "1.2.18"
 DEFAULT_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/chnnic/Courier-Scan-Manager/main/manifest.json"
 APP_SOURCE_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPANY_COLOR = "#0B5CAB"
 UNRECOGNIZED_COLOR = "#555555"
+UNRECOGNIZED_COMPANY_VALUE = "__unrecognized__"
+LEGACY_UNRECOGNIZED_COMPANY_NAMES = ("未识别", "Unrecognized", "Tidak Dikenali")
 BLACKLIST_ALERT_COLOR = "#B42318"
 LOCKED_ALERT_COLOR = "#C76F00"
 CONFIG_DB_NAME = "courier_config.db"
@@ -69,6 +72,7 @@ MANUAL_BACKUP_PREFIX = "manual_backup_"
 PRE_RESTORE_BACKUP_PREFIX = "pre_restore_backup_"
 PRE_UPDATE_BACKUP_PREFIX = "pre_update_backup_"
 MAX_AUTO_BACKUPS = 30
+MAX_UI_UNRECOGNIZED_ROWS = 500
 
 
 def month_key_from_date(value: str | datetime | None = None) -> str:
@@ -100,6 +104,55 @@ def list_month_db_paths() -> list[Path]:
         key=lambda path: month_key_from_db_path(path) or "",
         reverse=True,
     )
+
+
+def validate_sqlite_database(db_path: Path, mode: str) -> None:
+    if not db_path.is_file():
+        raise OSError(f"database file does not exist: {db_path}")
+
+    required_tables = {
+        "config": {"companies", "settings"},
+        "monthly": {"shipments"},
+    }
+    required_columns = {
+        "config": {
+            "companies": {"name", "prefix"},
+            "settings": {"key", "value"},
+        },
+        "monthly": {
+            "shipments": {"tracking_number", "company_name", "shipped_at", "shipping_day"},
+        },
+    }
+    if mode not in required_tables:
+        raise ValueError(f"unsupported database validation mode: {mode}")
+
+    connection = sqlite3.connect(db_path)
+    try:
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if not quick_check or quick_check[0] != "ok":
+            detail = quick_check[0] if quick_check else "no result"
+            raise sqlite3.DatabaseError(f"database integrity check failed: {detail}")
+        table_names = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        missing_tables = required_tables[mode] - table_names
+        if missing_tables:
+            raise sqlite3.DatabaseError(
+                f"database is missing required tables: {', '.join(sorted(missing_tables))}"
+            )
+        for table_name, expected_columns in required_columns[mode].items():
+            columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            missing_columns = expected_columns - columns
+            if missing_columns:
+                raise sqlite3.DatabaseError(
+                    f"database table {table_name} is missing required columns: "
+                    + ", ".join(sorted(missing_columns))
+                )
+    finally:
+        connection.close()
 
 
 def migrate_legacy_exports() -> None:
@@ -1168,6 +1221,7 @@ class Database:
                 )
                 """
             )
+        if self.mode in {"full", "config"}:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -1263,6 +1317,12 @@ class Database:
             )
             cursor.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_unrecognized_scanned_at
+                ON unrecognized_shipments (scanned_at)
+                """
+            )
+            cursor.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_duplicate_events_duplicate_day
                 ON duplicate_events (duplicate_day)
                 """
@@ -1336,7 +1396,17 @@ class Database:
         column_names = {column["name"] for column in columns}
         if "operator_name" not in column_names:
             cursor.execute("ALTER TABLE shipments ADD COLUMN operator_name TEXT NOT NULL DEFAULT ''")
-            self.conn.commit()
+        placeholders = ", ".join("?" for _ in LEGACY_UNRECOGNIZED_COMPANY_NAMES)
+        cursor.execute(
+            f"""
+            UPDATE shipments
+            SET company_name = ?
+            WHERE company_id IS NULL
+              AND company_name IN ({placeholders})
+            """,
+            (UNRECOGNIZED_COMPANY_VALUE, *LEGACY_UNRECOGNIZED_COMPANY_NAMES),
+        )
+        self.conn.commit()
 
     def _migrate_unrecognized_table(self) -> None:
         cursor = self.conn.cursor()
@@ -1362,7 +1432,12 @@ class Database:
         column_names = {column["name"] for column in columns}
         if "reason_note" not in column_names:
             cursor.execute("ALTER TABLE duplicate_events ADD COLUMN reason_note TEXT NOT NULL DEFAULT ''")
-            self.conn.commit()
+        placeholders = ", ".join("?" for _ in LEGACY_UNRECOGNIZED_COMPANY_NAMES)
+        cursor.execute(
+            f"UPDATE duplicate_events SET company_name = ? WHERE company_name IN ({placeholders})",
+            (UNRECOGNIZED_COMPANY_VALUE, *LEGACY_UNRECOGNIZED_COMPANY_NAMES),
+        )
+        self.conn.commit()
 
     def _initialize_settings(self) -> None:
         self.set_setting_if_missing("duplicate_policy", "all")
@@ -1467,6 +1542,27 @@ class Database:
                 notes = excluded.notes
             """,
             (tracking_number.strip().upper(), entry_type, notes.strip()),
+        )
+        self.conn.commit()
+
+    def upsert_blocked_tracking_numbers(self, tracking_numbers: list[str], entry_type: str, notes: str = "") -> None:
+        rows = [
+            (tracking_number.strip().upper(), entry_type, notes.strip())
+            for tracking_number in tracking_numbers
+            if tracking_number.strip()
+        ]
+        if not rows:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany(
+            """
+            INSERT INTO blocked_tracking_numbers (tracking_number, entry_type, notes)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tracking_number) DO UPDATE SET
+                entry_type = excluded.entry_type,
+                notes = excluded.notes
+            """,
+            rows,
         )
         self.conn.commit()
 
@@ -1603,9 +1699,7 @@ class Database:
         for row in self.get_companies():
             if normalized.startswith(row["prefix"].upper()):
                 return row["id"], row["name"], row["color"]
-        if self.translate:
-            return None, self.translate("unrecognized"), UNRECOGNIZED_COLOR
-        return None, "未识别", UNRECOGNIZED_COLOR
+        return None, UNRECOGNIZED_COMPANY_VALUE, UNRECOGNIZED_COLOR
 
     def get_company_color_by_name(self, company_name: str) -> str:
         cursor = self.conn.cursor()
@@ -1747,7 +1841,7 @@ class Database:
             }
 
         _, new_shipment = self.insert_shipment(normalized, operator_name)
-        if new_shipment["company_name"] == (self.translate("unrecognized") if self.translate else "未识别"):
+        if new_shipment["company_name"] == UNRECOGNIZED_COMPANY_VALUE:
             self.insert_anomaly_event(normalized, operator_name, "unrecognized", "")
         return True, None, new_shipment
 
@@ -2056,22 +2150,43 @@ class Database:
         cursor.execute(query, params)
         return cursor.fetchall()
 
-    def get_unrecognized_shipments(self) -> list[sqlite3.Row]:
+    def get_unrecognized_shipments(
+        self,
+        start_day: str | None = None,
+        end_day: str | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
+        clauses = ["resolved_at IS NULL"]
+        params: list[Any] = []
+        if start_day:
+            clauses.append("scanned_at >= ?")
+            params.append(f"{start_day} 00:00:00")
+        if end_day:
+            clauses.append("scanned_at <= ?")
+            params.append(f"{end_day} 23:59:59")
+        query = """
             SELECT id, tracking_number, operator_name, scanned_at
             FROM unrecognized_shipments
-            WHERE resolved_at IS NULL
-            ORDER BY scanned_at DESC
-            """
-        )
+        """
+        query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY scanned_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor.execute(query, params)
         return cursor.fetchall()
+
+    def count_unrecognized_shipments(self) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM unrecognized_shipments WHERE resolved_at IS NULL")
+        return int(cursor.fetchone()[0])
 
 
 class MonthlyDatabaseManager:
     def __init__(self, config_db_path: Path, translate: Any | None = None) -> None:
         self.translate = translate
+        self.config_db_path = config_db_path
         self.config_db = Database(config_db_path, translate, mode="config")
         self.month_dbs: dict[str, Database] = {}
         self._ensure_month_db(month_key_from_date())
@@ -2092,6 +2207,12 @@ class MonthlyDatabaseManager:
     def _sync_reference_tables(self, month_db: Database) -> None:
         config_cursor = self.config_db.conn.cursor()
         month_cursor = month_db.conn.cursor()
+        sensitive_tables = {
+            row[0]
+            for row in month_cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'blocked_tracking_numbers')"
+            ).fetchall()
+        }
 
         month_cursor.execute("DELETE FROM companies")
         company_rows = config_cursor.execute("SELECT id, name, prefix, color, created_at FROM companies ORDER BY id ASC").fetchall()
@@ -2104,28 +2225,14 @@ class MonthlyDatabaseManager:
                 [(row["id"], row["name"], row["prefix"], row["color"], row["created_at"]) for row in company_rows],
             )
 
-        month_cursor.execute("DELETE FROM settings")
-        setting_rows = config_cursor.execute("SELECT key, value FROM settings").fetchall()
-        if setting_rows:
-            month_cursor.executemany(
-                "INSERT INTO settings (key, value) VALUES (?, ?)",
-                [(row["key"], row["value"]) for row in setting_rows],
-            )
-
-        month_cursor.execute("DELETE FROM blocked_tracking_numbers")
-        blocked_rows = config_cursor.execute(
-            "SELECT id, tracking_number, entry_type, notes, created_at FROM blocked_tracking_numbers ORDER BY id ASC"
-        ).fetchall()
-        if blocked_rows:
-            month_cursor.executemany(
-                """
-                INSERT INTO blocked_tracking_numbers (id, tracking_number, entry_type, notes, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [(row["id"], row["tracking_number"], row["entry_type"], row["notes"], row["created_at"]) for row in blocked_rows],
-            )
+        # Monthly databases are business data files. Keep secrets and operational
+        # configuration exclusively in courier_config.db.
+        month_cursor.execute("DROP TABLE IF EXISTS settings")
+        month_cursor.execute("DROP TABLE IF EXISTS blocked_tracking_numbers")
 
         month_db.conn.commit()
+        if sensitive_tables:
+            month_db.conn.execute("VACUUM")
 
     def _sync_open_month_dbs(self) -> None:
         for month_db in self.month_dbs.values():
@@ -2147,17 +2254,92 @@ class MonthlyDatabaseManager:
         return sorted(month_keys, reverse=True)
 
     def get_month_db_paths(self) -> list[Path]:
-        return [CONFIG_DB_PATH] + [db_path_for_month(month_key) for month_key in self.list_month_keys()]
+        return [self.config_db_path] + [db_path_for_month(month_key) for month_key in self.list_month_keys()]
+
+    def backup_databases_to(self, snapshot_dir: Path) -> list[Path]:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshots: list[Path] = []
+
+        config_snapshot = self.config_db.backup_to(snapshot_dir / CONFIG_DB_NAME)
+        validate_sqlite_database(config_snapshot, "config")
+        snapshots.append(config_snapshot)
+
+        for month_key in self.list_month_keys():
+            month_db = self._ensure_month_db(month_key)
+            month_snapshot = month_db.backup_to(snapshot_dir / month_key_to_db_name(month_key))
+            validate_sqlite_database(month_snapshot, "monthly")
+            snapshots.append(month_snapshot)
+        return snapshots
 
     def replace_databases(self, replacement_paths: dict[str, Path]) -> None:
-        self.close()
-        for existing_path in self.get_month_db_paths():
-            if existing_path.name == CONFIG_DB_NAME and CONFIG_DB_NAME not in replacement_paths:
-                continue
-            if existing_path.exists():
-                existing_path.unlink()
+        allowed_replacements: dict[str, tuple[Path, str]] = {}
         for target_name, source_path in replacement_paths.items():
-            shutil.copy2(source_path, APP_DIR / target_name)
+            if target_name == CONFIG_DB_NAME:
+                mode = "config"
+            elif month_key_from_db_path(Path(target_name)):
+                mode = "monthly"
+            else:
+                raise OSError(f"unsupported database file in backup: {target_name}")
+            allowed_replacements[target_name] = (source_path, mode)
+        if not allowed_replacements:
+            raise OSError("restore does not contain any supported database files")
+
+        restore_dir = Path(tempfile.mkdtemp(prefix=".restore_", dir=str(APP_DIR)))
+        staged_dir = restore_dir / "staged"
+        originals_dir = restore_dir / "originals"
+        staged_dir.mkdir()
+        originals_dir.mkdir()
+        staged_paths: dict[str, Path] = {}
+        moved_originals: dict[Path, Path] = {}
+        installed_targets: set[Path] = set()
+        rollback_complete = False
+
+        try:
+            for target_name, (source_path, mode) in allowed_replacements.items():
+                staged_path = staged_dir / target_name
+                shutil.copy2(source_path, staged_path)
+                validate_sqlite_database(staged_path, mode)
+                staged_paths[target_name] = staged_path
+
+            self.close()
+            existing_targets = list_month_db_paths()
+            if CONFIG_DB_NAME in allowed_replacements and self.config_db_path.exists():
+                existing_targets.append(self.config_db_path)
+
+            for existing_path in existing_targets:
+                if not existing_path.exists():
+                    continue
+                original_path = originals_dir / existing_path.name
+                os.replace(existing_path, original_path)
+                moved_originals[existing_path] = original_path
+
+            for target_name, staged_path in staged_paths.items():
+                target_path = APP_DIR / target_name
+                os.replace(staged_path, target_path)
+                installed_targets.add(target_path)
+            rollback_complete = True
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for target_path in installed_targets:
+                try:
+                    target_path.unlink(missing_ok=True)
+                except OSError as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+            for target_path, original_path in moved_originals.items():
+                try:
+                    os.replace(original_path, target_path)
+                except OSError as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+            rollback_complete = not rollback_errors
+            if rollback_errors:
+                raise OSError(
+                    f"restore failed and rollback files remain in {restore_dir}: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
+        finally:
+            if rollback_complete:
+                shutil.rmtree(restore_dir, ignore_errors=True)
 
     def _iter_month_dbs(
         self,
@@ -2197,57 +2379,64 @@ class MonthlyDatabaseManager:
                 totals[key][value_name] += int(row[value_name])
         return list(totals.values())
 
+    def _display_company_name(self, company_name: str) -> str:
+        if company_name != UNRECOGNIZED_COMPANY_VALUE:
+            return company_name
+        return self.translate("unrecognized") if self.translate else "未识别"
+
+    def _stored_company_name(self, company_name: str | None) -> str | None:
+        if not company_name:
+            return company_name
+        if company_name == self._display_company_name(UNRECOGNIZED_COMPANY_VALUE):
+            return UNRECOGNIZED_COMPANY_VALUE
+        if company_name in LEGACY_UNRECOGNIZED_COMPANY_NAMES:
+            return UNRECOGNIZED_COMPANY_VALUE
+        return company_name
+
     def get_setting(self, key: str, default: str = "") -> str:
         return self.config_db.get_setting(key, default)
 
     def set_setting(self, key: str, value: str) -> None:
         self.config_db.set_setting(key, value)
-        self._sync_open_month_dbs()
 
     def get_duplicate_policy(self) -> str:
         return self.config_db.get_duplicate_policy()
 
     def set_duplicate_policy(self, value: str) -> None:
         self.config_db.set_duplicate_policy(value)
-        self._sync_open_month_dbs()
 
     def is_sound_enabled(self) -> bool:
         return self.config_db.is_sound_enabled()
 
     def set_sound_enabled(self, enabled: bool) -> None:
         self.config_db.set_sound_enabled(enabled)
-        self._sync_open_month_dbs()
 
     def is_block_unrecognized_enabled(self) -> bool:
         return self.config_db.is_block_unrecognized_enabled()
 
     def set_block_unrecognized_enabled(self, enabled: bool) -> None:
         self.config_db.set_block_unrecognized_enabled(enabled)
-        self._sync_open_month_dbs()
 
     def get_operator_shortcuts(self) -> list[str]:
         return self.config_db.get_operator_shortcuts()
 
     def save_operator_shortcut(self, operator_name: str, limit: int = 6) -> list[str]:
-        shortcuts = self.config_db.save_operator_shortcut(operator_name, limit)
-        self._sync_open_month_dbs()
-        return shortcuts
+        return self.config_db.save_operator_shortcut(operator_name, limit)
 
     def delete_operator_shortcut(self, operator_name: str) -> list[str]:
-        shortcuts = self.config_db.delete_operator_shortcut(operator_name)
-        self._sync_open_month_dbs()
-        return shortcuts
+        return self.config_db.delete_operator_shortcut(operator_name)
 
     def get_blocked_tracking_numbers(self) -> list[sqlite3.Row]:
         return self.config_db.get_blocked_tracking_numbers()
 
     def upsert_blocked_tracking_number(self, tracking_number: str, entry_type: str, notes: str = "") -> None:
         self.config_db.upsert_blocked_tracking_number(tracking_number, entry_type, notes)
-        self._sync_open_month_dbs()
+
+    def upsert_blocked_tracking_numbers(self, tracking_numbers: list[str], entry_type: str, notes: str = "") -> None:
+        self.config_db.upsert_blocked_tracking_numbers(tracking_numbers, entry_type, notes)
 
     def delete_blocked_tracking_number(self, blocked_id: int) -> None:
         self.config_db.delete_blocked_tracking_number(blocked_id)
-        self._sync_open_month_dbs()
 
     def get_blocked_tracking_entry(self, tracking_number: str) -> sqlite3.Row | None:
         return self.config_db.get_blocked_tracking_entry(tracking_number)
@@ -2266,7 +2455,7 @@ class MonthlyDatabaseManager:
         for _month_key, db in self._iter_month_dbs():
             for row in db.get_company_stats():
                 if row["company_name"]:
-                    names.add(row["company_name"])
+                    names.add(self._display_company_name(row["company_name"]))
         return sorted(names)
 
     def upsert_company(self, company_id: int | None, name: str, prefix: str, color: str) -> None:
@@ -2281,7 +2470,8 @@ class MonthlyDatabaseManager:
         return self.config_db.resolve_company(tracking_number)
 
     def get_company_color_by_name(self, company_name: str) -> str:
-        return self.config_db.get_company_color_by_name(company_name)
+        stored_name = self._stored_company_name(company_name) or company_name
+        return self.config_db.get_company_color_by_name(stored_name)
 
     def get_last_shipment(self, tracking_number: str, duplicate_policy: str | None = None) -> sqlite3.Row | None:
         normalized = tracking_number.strip().upper()
@@ -2304,7 +2494,7 @@ class MonthlyDatabaseManager:
             self._current_db().insert_anomaly_event(normalized, operator_name, anomaly_type, blocked_entry["notes"])
             return False, None, {
                 "tracking_number": normalized,
-                "company_name": self.translate("unrecognized") if self.translate else "未识别",
+                "company_name": self._display_company_name(UNRECOGNIZED_COMPANY_VALUE),
                 "company_color": UNRECOGNIZED_COLOR,
                 "shipped_at": "",
                 "operator_name": operator_name,
@@ -2316,7 +2506,7 @@ class MonthlyDatabaseManager:
             self._current_db().insert_anomaly_event(normalized, operator_name, "format", "tracking_too_short")
             return False, None, {
                 "tracking_number": normalized,
-                "company_name": self.translate("unrecognized") if self.translate else "未识别",
+                "company_name": self._display_company_name(UNRECOGNIZED_COMPANY_VALUE),
                 "company_color": UNRECOGNIZED_COLOR,
                 "shipped_at": "",
                 "operator_name": operator_name,
@@ -2327,9 +2517,11 @@ class MonthlyDatabaseManager:
         last_shipment = self.get_last_shipment(normalized, self.get_duplicate_policy())
         if last_shipment:
             self._current_db().insert_duplicate_event(normalized, last_shipment["company_name"], operator_name, last_shipment["shipped_at"])
-            return False, last_shipment, {
+            displayed_last_shipment = dict(last_shipment)
+            displayed_last_shipment["company_name"] = self._display_company_name(last_shipment["company_name"])
+            return False, displayed_last_shipment, {
                 "tracking_number": normalized,
-                "company_name": last_shipment["company_name"],
+                "company_name": displayed_last_shipment["company_name"],
                 "company_color": self.get_company_color_by_name(last_shipment["company_name"]),
                 "shipped_at": last_shipment["shipped_at"],
                 "operator_name": operator_name,
@@ -2341,7 +2533,7 @@ class MonthlyDatabaseManager:
             self._current_db().insert_anomaly_event(normalized, operator_name, "unrecognized", "")
             return False, None, {
                 "tracking_number": normalized,
-                "company_name": company_name,
+                "company_name": self._display_company_name(company_name),
                 "company_color": company_color,
                 "shipped_at": "",
                 "operator_name": operator_name,
@@ -2370,7 +2562,7 @@ class MonthlyDatabaseManager:
         return True, None, {
             "shipment_id": shipment_id,
             "tracking_number": normalized,
-            "company_name": company_name,
+            "company_name": self._display_company_name(company_name),
             "company_color": company_color,
             "operator_name": operator_name,
             "shipped_at": shipped_at,
@@ -2415,8 +2607,11 @@ class MonthlyDatabaseManager:
             db.conn.commit()
         return resolved_total
 
-    def get_today_company_counts(self) -> list[sqlite3.Row]:
-        return self._current_db().get_today_company_counts()
+    def get_today_company_counts(self) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._current_db().get_today_company_counts()]
+        for row in rows:
+            row["company_name"] = self._display_company_name(row["company_name"])
+        return rows
 
     def get_today_total(self) -> int:
         return self._current_db().get_today_total()
@@ -2427,8 +2622,11 @@ class MonthlyDatabaseManager:
     def get_today_duplicate_total(self) -> int:
         return self._current_db().get_today_duplicate_total()
 
-    def get_today_duplicate_events(self) -> list[sqlite3.Row]:
-        return self._current_db().get_today_duplicate_events()
+    def get_today_duplicate_events(self) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._current_db().get_today_duplicate_events()]
+        for row in rows:
+            row["company_name"] = self._display_company_name(row["company_name"])
+        return rows
 
     def get_today_anomaly_events(self) -> list[sqlite3.Row]:
         return self._current_db().get_today_anomaly_events()
@@ -2445,8 +2643,9 @@ class MonthlyDatabaseManager:
     ) -> list[dict[str, Any]]:
         if not start_day and not end_day and not selected_month:
             start_day = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d")
+        stored_company_name = self._stored_company_name(company_name)
         aggregated = self._aggregate_counts(
-            [db.get_daily_stats(start_day, end_day, company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
+            [db.get_daily_stats(start_day, end_day, stored_company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
             "shipping_day",
         )
         return sorted(aggregated, key=lambda row: row["shipping_day"], reverse=True)
@@ -2458,13 +2657,15 @@ class MonthlyDatabaseManager:
         company_name: str | None = None,
         selected_month: str | None = None,
     ) -> list[dict[str, Any]]:
+        stored_company_name = self._stored_company_name(company_name)
         aggregated = self._aggregate_counts(
-            [db.get_company_stats(start_day, end_day, company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
+            [db.get_company_stats(start_day, end_day, stored_company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
             "company_name",
             extra_fields=("color",),
         )
         for row in aggregated:
             row["color"] = self.get_company_color_by_name(row["company_name"])
+            row["company_name"] = self._display_company_name(row["company_name"])
         return sorted(aggregated, key=lambda row: (-row["total"], row["company_name"]))
 
     def get_operator_stats(
@@ -2474,8 +2675,9 @@ class MonthlyDatabaseManager:
         company_name: str | None = None,
         selected_month: str | None = None,
     ) -> list[dict[str, Any]]:
+        stored_company_name = self._stored_company_name(company_name)
         aggregated = self._aggregate_counts(
-            [db.get_operator_stats(start_day, end_day, company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
+            [db.get_operator_stats(start_day, end_day, stored_company_name) for _month_key, db in self._iter_month_dbs(selected_month, start_day, end_day)],
             "operator_name",
         )
         return sorted(aggregated, key=lambda row: (-row["total"], row["operator_name"]))
@@ -2485,12 +2687,16 @@ class MonthlyDatabaseManager:
         for month_key, db in self._iter_month_dbs(selected_month):
             for row in db.query_tracking_number(tracking_number):
                 row_dict = dict(row)
+                row_dict["company_name"] = self._display_company_name(row_dict["company_name"])
                 row_dict["month_key"] = month_key
                 rows.append(row_dict)
         return sorted(rows, key=lambda row: row["shipped_at"], reverse=True)
 
-    def get_recent_shipments(self, limit: int = 100) -> list[sqlite3.Row]:
-        return self._current_db().get_recent_shipments(limit)
+    def get_recent_shipments(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._current_db().get_recent_shipments(limit)]
+        for row in rows:
+            row["company_name"] = self._display_company_name(row["company_name"])
+        return rows
 
     def delete_shipment(self, shipment_id: int) -> None:
         self._current_db().delete_shipment(shipment_id)
@@ -2509,32 +2715,130 @@ class MonthlyDatabaseManager:
         selected_month: str | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        stored_company_name = self._stored_company_name(company_name)
         for month_key, db in self._iter_month_dbs(selected_month, start_day, end_day):
-            for row in db.get_all_shipments(start_day, end_day, company_name):
+            for row in db.get_all_shipments(start_day, end_day, stored_company_name):
                 row_dict = dict(row)
+                row_dict["company_name"] = self._display_company_name(row_dict["company_name"])
                 row_dict["month_key"] = month_key
                 rows.append(row_dict)
         return sorted(rows, key=lambda row: row["shipped_at"], reverse=True)
 
-    def get_unrecognized_shipments(self, selected_month: str | None = None) -> list[dict[str, Any]]:
+    def get_unrecognized_shipments(
+        self,
+        selected_month: str | None = None,
+        start_day: str | None = None,
+        end_day: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for month_key, db in self._iter_month_dbs(selected_month):
-            for row in db.get_unrecognized_shipments():
+        for month_key, db in self._iter_month_dbs(selected_month, start_day, end_day):
+            for row in db.get_unrecognized_shipments(start_day, end_day, limit):
                 row_dict = dict(row)
                 row_dict["month_key"] = month_key
                 rows.append(row_dict)
-        return sorted(rows, key=lambda row: row["scanned_at"], reverse=True)
+        sorted_rows = sorted(rows, key=lambda row: row["scanned_at"], reverse=True)
+        return sorted_rows[:limit] if limit is not None else sorted_rows
+
+    def count_unrecognized_shipments(self) -> int:
+        return sum(db.count_unrecognized_shipments() for _month_key, db in self._iter_month_dbs())
 
     def archive_old_data(self, cutoff_day: str, archive_dir: Path) -> Path | None:
         cutoff_month = cutoff_day[:7]
-        month_paths = [db_path_for_month(month_key) for month_key in self.list_month_keys() if month_key < cutoff_month and db_path_for_month(month_key).exists()]
-        if not month_paths:
-            return None
         archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = archive_dir / f"courier_month_archive_before_{cutoff_day.replace('-', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
-            for month_path in month_paths:
-                archive_file.write(month_path, arcname=month_path.name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        archive_path = archive_dir / f"courier_month_archive_before_{cutoff_day.replace('-', '')}_{timestamp}.zip"
+        temp_zip_path = archive_path.with_suffix(".tmp")
+        archived_months: list[tuple[str, Database]] = []
+
+        try:
+            with tempfile.TemporaryDirectory(dir=str(archive_dir)) as temp_dir_str:
+                temp_dir = Path(temp_dir_str)
+                for month_key in self.list_month_keys():
+                    if month_key > cutoff_month:
+                        continue
+                    month_db = self._ensure_month_db(month_key)
+                    cursor = month_db.conn.cursor()
+                    shipment_total = int(
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM shipments WHERE shipping_day < ?", (cutoff_day,)
+                        ).fetchone()[0]
+                    )
+                    duplicate_total = int(
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM duplicate_events WHERE duplicate_day < ?", (cutoff_day,)
+                        ).fetchone()[0]
+                    )
+                    anomaly_total = int(
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM anomaly_events WHERE event_day < ?", (cutoff_day,)
+                        ).fetchone()[0]
+                    )
+                    if shipment_total == 0 and duplicate_total == 0 and anomaly_total == 0:
+                        continue
+
+                    archive_db_path = temp_dir / month_key_to_db_name(month_key)
+                    month_db.backup_to(archive_db_path)
+                    archive_conn = sqlite3.connect(archive_db_path)
+                    try:
+                        archive_cursor = archive_conn.cursor()
+                        archive_cursor.execute("DELETE FROM shipments WHERE shipping_day >= ?", (cutoff_day,))
+                        archive_cursor.execute(
+                            "DELETE FROM unrecognized_shipments WHERE shipment_id NOT IN (SELECT id FROM shipments)"
+                        )
+                        archive_cursor.execute(
+                            "DELETE FROM duplicate_events WHERE duplicate_day >= ?", (cutoff_day,)
+                        )
+                        archive_cursor.execute("DELETE FROM anomaly_events WHERE event_day >= ?", (cutoff_day,))
+                        archive_cursor.execute("DROP TABLE IF EXISTS settings")
+                        archive_cursor.execute("DROP TABLE IF EXISTS blocked_tracking_numbers")
+                        archive_conn.commit()
+                        archive_conn.execute("VACUUM")
+                    finally:
+                        archive_conn.close()
+                    validate_sqlite_database(archive_db_path, "monthly")
+                    archived_months.append((month_key, month_db))
+
+                if not archived_months:
+                    return None
+
+                with zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
+                    for month_key, _month_db in archived_months:
+                        archive_db_path = temp_dir / month_key_to_db_name(month_key)
+                        archive_file.write(archive_db_path, arcname=archive_db_path.name)
+
+            with zipfile.ZipFile(temp_zip_path, "r") as archive_file:
+                corrupt_member = archive_file.testzip()
+                if corrupt_member:
+                    raise OSError(f"archive verification failed: {corrupt_member}")
+            os.replace(temp_zip_path, archive_path)
+        finally:
+            temp_zip_path.unlink(missing_ok=True)
+
+        for month_key, month_db in archived_months:
+            cursor = month_db.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    "DELETE FROM unrecognized_shipments WHERE shipment_id IN (SELECT id FROM shipments WHERE shipping_day < ?)",
+                    (cutoff_day,),
+                )
+                cursor.execute("DELETE FROM shipments WHERE shipping_day < ?", (cutoff_day,))
+                cursor.execute("DELETE FROM duplicate_events WHERE duplicate_day < ?", (cutoff_day,))
+                cursor.execute("DELETE FROM anomaly_events WHERE event_day < ?", (cutoff_day,))
+                month_db.conn.commit()
+            except sqlite3.Error:
+                month_db.conn.rollback()
+                raise
+            if month_key < cutoff_month:
+                remaining_total = sum(
+                    int(month_db.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+                    for table_name in ("shipments", "unrecognized_shipments", "duplicate_events", "anomaly_events")
+                )
+                if remaining_total == 0:
+                    month_db.close()
+                    self.month_dbs.pop(month_key, None)
+                    db_path_for_month(month_key).unlink(missing_ok=True)
         return archive_path
 
 class ReportExporter:
@@ -2614,7 +2918,7 @@ class ReportExporter:
         ]
         unrecognized_rows = [
             [row["tracking_number"], row["operator_name"], row["scanned_at"]]
-            for row in self.db.get_unrecognized_shipments(selected_month)
+            for row in self.db.get_unrecognized_shipments(selected_month, start_day, end_day)
         ]
 
         summary_sections = [
@@ -2706,17 +3010,26 @@ class BackupManager:
         self.backup_dir = backup_dir
 
     def _timestamped_backup_path(self, prefix: str) -> Path:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         return self.backup_dir / f"{prefix}{timestamp}.zip"
 
     def create_backup(self, prefix: str = MANUAL_BACKUP_PREFIX) -> Path:
         backup_path = self._timestamped_backup_path(prefix)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
-            for db_path in self.db.get_month_db_paths():
-                if not db_path.exists():
-                    continue
-                archive_file.write(db_path, arcname=db_path.name)
+        temp_zip_path = backup_path.with_suffix(".tmp")
+        try:
+            with tempfile.TemporaryDirectory(dir=str(self.backup_dir)) as snapshot_dir_str:
+                snapshot_paths = self.db.backup_databases_to(Path(snapshot_dir_str))
+                with zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
+                    for snapshot_path in snapshot_paths:
+                        archive_file.write(snapshot_path, arcname=snapshot_path.name)
+            with zipfile.ZipFile(temp_zip_path, "r") as archive_file:
+                corrupt_member = archive_file.testzip()
+                if corrupt_member:
+                    raise OSError(f"backup verification failed: {corrupt_member}")
+            os.replace(temp_zip_path, backup_path)
+        finally:
+            temp_zip_path.unlink(missing_ok=True)
         return backup_path
 
     def create_daily_auto_backup(self) -> Path | None:
@@ -2748,7 +3061,7 @@ class UpdateManager:
     def should_use_windows_downloader(self) -> bool:
         return sys.platform.startswith("win") and getattr(sys, "frozen", False)
 
-    def run_powershell(self, script: str, *args: str) -> bytes:
+    def run_powershell(self, script: str, *args: str, timeout_seconds: int = 30) -> bytes:
         self.update_dir.mkdir(parents=True, exist_ok=True)
         script_path = self.update_dir / f"powershell_task_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.ps1"
         script_path.write_text(script, encoding="utf-8")
@@ -2758,37 +3071,42 @@ class UpdateManager:
                 check=True,
                 capture_output=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=timeout_seconds,
             )
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode("utf-8", errors="replace").strip()
             raise OSError(stderr or str(exc)) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"PowerShell operation timed out after {timeout_seconds} seconds") from exc
         finally:
             script_path.unlink(missing_ok=True)
         return completed.stdout
 
     def fetch_text_with_powershell(self, url: str) -> str:
         script = """
-param([string]$Url)
+param([string]$Url, [int]$TimeoutSeconds)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$response = Invoke-WebRequest -UseBasicParsing -Uri $Url
+$response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSeconds
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::Write($response.Content)
 """
-        return self.run_powershell(script, url).decode("utf-8-sig", errors="replace")
+        return self.run_powershell(script, url, "20", timeout_seconds=30).decode("utf-8-sig", errors="replace")
 
     def download_file_with_powershell(self, url: str, target_path: Path) -> None:
         script = """
-param([string]$Url, [string]$OutputPath)
+param([string]$Url, [string]$OutputPath, [int]$TimeoutSeconds)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
+Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath -TimeoutSec $TimeoutSeconds
 """
-        self.run_powershell(script, url, str(target_path))
+        self.run_powershell(script, url, str(target_path), "180", timeout_seconds=210)
 
     def fetch_manifest(self, manifest_url: str) -> dict[str, Any]:
+        if urlparse(manifest_url).scheme.lower() != "https":
+            raise ValueError("manifest_url_must_use_https")
         if self.should_use_windows_downloader():
             payload = self.fetch_text_with_powershell(manifest_url)
         else:
@@ -2797,7 +3115,7 @@ Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
         manifest = json.loads(payload)
         if not isinstance(manifest, dict):
             raise ValueError("manifest_not_dict")
-        required_keys = {"version", "download_url"}
+        required_keys = {"version", "download_url", "sha256"}
         if not required_keys.issubset(manifest):
             raise ValueError("manifest_missing_keys")
         return manifest
@@ -2822,6 +3140,10 @@ Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
 
     def download_update_package(self, download_url: str, expected_sha256: str | None = None) -> Path:
         parsed = urlparse(download_url)
+        if parsed.scheme.lower() != "https":
+            raise ValueError("download_url_must_use_https")
+        if not expected_sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256.strip()):
+            raise ValueError("valid_sha256_required")
         file_name = Path(parsed.path).name or "courier_update.exe"
         target_path = self.update_dir / file_name
         self.update_dir.mkdir(parents=True, exist_ok=True)
@@ -2835,11 +3157,10 @@ Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutputPath
                     if not chunk:
                         break
                     output.write(chunk)
-        if expected_sha256:
-            digest = hashlib.sha256(target_path.read_bytes()).hexdigest().lower()
-            if digest != expected_sha256.strip().lower():
-                target_path.unlink(missing_ok=True)
-                raise ValueError("sha256_mismatch")
+        digest = hashlib.sha256(target_path.read_bytes()).hexdigest().lower()
+        if digest != expected_sha256.strip().lower():
+            target_path.unlink(missing_ok=True)
+            raise ValueError("sha256_mismatch")
         return target_path
 
     def create_windows_upgrade_script(self, current_exe: Path, new_exe: Path, app_pid: int) -> Path:
@@ -2969,6 +3290,8 @@ class CourierApp:
         self.telegram_notifier = TelegramNotifier()
         self.selected_company_id: int | None = None
         self.backup_sort_descending = True
+        self.update_operation_in_progress = False
+        self.ui_queue: queue.Queue[Any] = queue.Queue()
 
         self.root.title(self.window_title())
         self.root.geometry("1220x780")
@@ -3026,10 +3349,11 @@ class CourierApp:
         self.load_sound_setting()
         self.load_block_unrecognized_setting()
         self.rebuild_operator_shortcut_buttons()
-        self.backup_manager.create_daily_auto_backup()
         self.refresh_all_views()
         self.root.bind("<Configure>", self.on_root_resize)
         self.root.after(50, self.update_scan_layout_mode)
+        self.root.after(100, self.process_ui_queue)
+        self.root.after(1000, self.run_daily_auto_backup)
         self.root.after(3000, self.auto_check_for_updates_on_startup)
 
     def t(self, key: str, **kwargs: Any) -> str:
@@ -4264,8 +4588,7 @@ class CourierApp:
         if not tracking_numbers:
             self.messagebox.showwarning(self.t("warning"), self.t("quick_block_empty"))
             return
-        for tracking_number in tracking_numbers:
-            self.db.upsert_blocked_tracking_number(tracking_number, entry_type, "")
+        self.db.upsert_blocked_tracking_numbers(tracking_numbers, entry_type, "")
         self.quick_block_text.delete("1.0", self.tk.END)
         self.refresh_blocked_tracking_tab()
         message_key = "quick_block_saved_blacklist" if entry_type == "blacklist" else "quick_block_saved_locked"
@@ -4587,8 +4910,6 @@ class CourierApp:
         self.throughput_10min_value.config(text=str(throughput["last_10_min"]))
         self.throughput_1hour_value.config(text=str(throughput["last_1_hour"]))
         self.throughput_avg_value.config(text=f'{throughput["avg_per_min"]:.2f}')
-        self.rebuild_operator_shortcut_buttons()
-
         self.clear_tree(self.count_tree)
         for row in self.db.get_today_company_counts():
             self.count_tree.insert("", "end", values=(row["company_name"], row["total"]))
@@ -4639,8 +4960,9 @@ class CourierApp:
             self.rules_tree.insert("", "end", values=(row["id"], row["name"], row["prefix"], row["color"]))
 
     def refresh_unrecognized_tab(self) -> None:
-        rows = self.db.get_unrecognized_shipments()
-        self.unrecognized_count_label.config(text=self.t("unrecognized_count", total=len(rows)))
+        total = self.db.count_unrecognized_shipments()
+        rows = self.db.get_unrecognized_shipments(limit=MAX_UI_UNRECOGNIZED_ROWS)
+        self.unrecognized_count_label.config(text=self.t("unrecognized_count", total=total))
         self.clear_tree(self.unrecognized_tree)
         for row in rows:
             display_operator = row["operator_name"] if row["operator_name"] else "-"
@@ -4698,6 +5020,15 @@ class CourierApp:
         self.refresh_duplicates_tab()
         self.refresh_anomalies_tab()
         self.refresh_blocked_tracking_tab()
+        self.scan_entry.focus_set()
+
+    def refresh_after_scan(self, shipment: dict[str, Any], saved: bool) -> None:
+        self.refresh_scan_tab()
+        self.refresh_month_filter_options()
+        self.refresh_duplicates_tab()
+        self.refresh_anomalies_tab()
+        if saved and shipment.get("company_name") == self.t("unrecognized"):
+            self.refresh_unrecognized_tab()
         self.scan_entry.focus_set()
 
     def handle_scan_event(self, _event: Any) -> None:
@@ -4771,7 +5102,7 @@ class CourierApp:
             self.big_company_label.config(text=shipment["company_name"], foreground=shipment["company_color"])
 
         self.scan_entry.delete(0, self.tk.END)
-        self.refresh_all_views()
+        self.refresh_after_scan(shipment, saved)
         self.scan_entry.focus_set()
 
     def export_excel_report(self) -> None:
@@ -4974,7 +5305,7 @@ class CourierApp:
                             self.telegram_notifier.send_document(target["token"], target["chat_id"], file_path, caption=file_path.name)
                 except Exception as exc:
                     errors.append(f"{target['name']}: {exc}")
-            self.root.after(0, lambda: self.finish_telegram_send(errors))
+            self.schedule_on_ui(lambda: self.finish_telegram_send(errors))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5050,7 +5381,48 @@ class CourierApp:
             return
         self.check_for_updates(silent=True)
 
+    def run_daily_auto_backup(self) -> None:
+        try:
+            created_path = self.backup_manager.create_daily_auto_backup()
+            if created_path:
+                self.refresh_backup_list()
+        except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+            self.result_label.config(
+                text=self.t("backup_failed_message", error=exc),
+                foreground="#A61B1B",
+            )
+        finally:
+            self.root.after(60 * 60 * 1000, self.run_daily_auto_backup)
+
+    def set_update_operation_state(self, in_progress: bool) -> None:
+        self.update_operation_in_progress = in_progress
+        if hasattr(self, "check_update_btn"):
+            self.check_update_btn.state(["disabled"] if in_progress else ["!disabled"])
+
+    def schedule_on_ui(self, callback: Any) -> None:
+        self.ui_queue.put(callback)
+
+    def process_ui_queue(self) -> None:
+        try:
+            while True:
+                try:
+                    callback = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                callback()
+        finally:
+            self.root.after(100, self.process_ui_queue)
+
+    def close_application(self) -> None:
+        self.scan_canvas.unbind_all("<MouseWheel>")
+        try:
+            self.db.close()
+        finally:
+            self.root.destroy()
+
     def check_for_updates(self, silent: bool = False) -> None:
+        if self.update_operation_in_progress:
+            return
         if not self.update_manager.is_supported_environment():
             if silent:
                 return
@@ -5064,18 +5436,39 @@ class CourierApp:
             self.messagebox.showwarning(self.t("warning"), self.t("update_manifest_missing"))
             return
 
-        try:
-            manifest = self.update_manager.fetch_manifest(manifest_url)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            if silent:
-                return
-            self.messagebox.showerror(self.t("warning"), self.t("update_check_failed", error=exc))
+        self.set_update_operation_state(True)
+
+        def worker() -> None:
+            try:
+                manifest = self.update_manager.fetch_manifest(manifest_url)
+                error: Exception | None = None
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                manifest = None
+                error = exc
+            self.schedule_on_ui(
+                lambda manifest=manifest, error=error: self.finish_update_check(silent, manifest, error)
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_update_check(
+        self,
+        silent: bool,
+        manifest: dict[str, Any] | None,
+        error: Exception | None,
+    ) -> None:
+        self.set_update_operation_state(False)
+        if error is not None:
+            if not silent:
+                self.messagebox.showerror(self.t("warning"), self.t("update_check_failed", error=error))
+            return
+        if manifest is None:
             return
 
         latest_version = str(manifest.get("version", "")).strip()
         download_url = str(manifest.get("download_url", "")).strip()
         sha256_value = str(manifest.get("sha256", "")).strip() or None
-        if not latest_version or not download_url:
+        if not latest_version or not download_url or not sha256_value:
             if silent:
                 return
             self.messagebox.showerror(self.t("warning"), self.t("update_invalid_manifest"))
@@ -5095,20 +5488,35 @@ class CourierApp:
 
         try:
             self.backup_manager.create_backup(PRE_UPDATE_BACKUP_PREFIX)
-        except OSError as exc:
+        except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
             self.messagebox.showerror(self.t("warning"), self.t("update_backup_failed", error=exc))
             return
 
-        try:
-            downloaded_path = self.update_manager.download_update_package(download_url, sha256_value)
-            current_exe = Path(sys.executable)
-            script_path = self.update_manager.create_windows_upgrade_script(current_exe, downloaded_path, os.getpid())
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            subprocess.Popen(["cmd", "/c", str(script_path)], creationflags=creation_flags)
-        except (OSError, ValueError) as exc:
-            self.messagebox.showerror(self.t("warning"), self.t("update_download_failed", error=exc))
-            return
+        self.set_update_operation_state(True)
 
+        def download_worker() -> None:
+            try:
+                downloaded_path = self.update_manager.download_update_package(download_url, sha256_value)
+                current_exe = Path(sys.executable)
+                script_path = self.update_manager.create_windows_upgrade_script(
+                    current_exe, downloaded_path, os.getpid()
+                )
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+                subprocess.Popen(["cmd", "/c", str(script_path)], creationflags=creation_flags)
+                error: Exception | None = None
+            except (OSError, ValueError) as exc:
+                error = exc
+            self.schedule_on_ui(lambda error=error: self.finish_update_download(error))
+
+        threading.Thread(target=download_worker, daemon=True).start()
+
+    def finish_update_download(self, error: Exception | None) -> None:
+        if error is not None:
+            self.set_update_operation_state(False)
+            self.messagebox.showerror(self.t("warning"), self.t("update_download_failed", error=error))
+            return
         self.force_exit_for_update()
 
     def force_exit_for_update(self) -> None:
@@ -5203,21 +5611,38 @@ class CourierApp:
             with tempfile.TemporaryDirectory(dir=str(BACKUP_DIR)) as temp_dir_str:
                 temp_dir = Path(temp_dir_str)
                 with zipfile.ZipFile(backup_path, "r") as archive_file:
-                    archive_file.extractall(temp_dir)
+                    database_members = []
+                    for member in archive_file.infolist():
+                        member_path = Path(member.filename)
+                        if member.is_dir():
+                            continue
+                        if member_path.name != member.filename:
+                            raise OSError(f"backup contains an unsafe path: {member.filename}")
+                        if member.filename != CONFIG_DB_NAME and not month_key_from_db_path(member_path):
+                            raise OSError(f"backup contains an unsupported file: {member.filename}")
+                        database_members.append(member)
+                    for member in database_members:
+                        archive_file.extract(member, temp_dir)
 
                 replacement_paths: dict[str, Path] = {}
                 config_path = temp_dir / CONFIG_DB_NAME
                 if config_path.exists():
-                    temp_config = Database(config_path, self.t, mode="config")
-                    temp_config.close()
+                    validate_sqlite_database(config_path, "config")
                     replacement_paths[CONFIG_DB_NAME] = config_path
 
                 for month_path in temp_dir.glob(f"{MONTH_DB_PREFIX}*.db"):
                     month_key = month_key_from_db_path(month_path)
                     if not month_key:
                         continue
-                    temp_month = Database(month_path, self.t, mode="monthly")
-                    temp_month.close()
+                    validate_sqlite_database(month_path, "monthly")
+                    scrub_connection = sqlite3.connect(month_path)
+                    try:
+                        scrub_connection.execute("DROP TABLE IF EXISTS settings")
+                        scrub_connection.execute("DROP TABLE IF EXISTS blocked_tracking_numbers")
+                        scrub_connection.commit()
+                        scrub_connection.execute("VACUUM")
+                    finally:
+                        scrub_connection.close()
                     replacement_paths[month_path.name] = month_path
 
                 if not replacement_paths:
@@ -5469,7 +5894,7 @@ def main() -> None:
     except tk.TclError:
         pass
     app = CourierApp(root, tk, ttk, messagebox)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.scan_canvas.unbind_all("<MouseWheel>"), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", app.close_application)
     root.mainloop()
 
 
